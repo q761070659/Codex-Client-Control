@@ -5,13 +5,15 @@ import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
-import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -21,11 +23,14 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 public final class ControlHttpServer {
     private static final Gson GSON = new Gson();
+    private static final String[] MOVEMENT_SEQUENCE_KEYS = { "forward", "back", "left", "right", "jump", "sneak", "sprint", "use", "attack" };
 
     private final ControlConfig config;
     private final MinecraftBridge bridge;
@@ -103,6 +108,18 @@ public final class ControlHttpServer {
             if ("GET".equalsIgnoreCase(request.method()) && "/screen".equals(request.path())) {
                 return jsonResponse(200, bridge.getScreenSnapshot());
             }
+            if ("GET".equalsIgnoreCase(request.method()) && "/target".equals(request.path())) {
+                return jsonResponse(200, bridge.getCrosshairTarget());
+            }
+            if ("GET".equalsIgnoreCase(request.method()) && "/container".equals(request.path())) {
+                return jsonResponse(200, bridge.getContainerContents());
+            }
+            if ("GET".equalsIgnoreCase(request.method()) && "/players".equals(request.path())) {
+                return jsonResponse(200, bridge.getPlayerList());
+            }
+            if ("GET".equalsIgnoreCase(request.method()) && "/debug/fake-player".equals(request.path())) {
+                return jsonResponse(200, bridge.listDebugFakePlayers());
+            }
             if ("POST".equalsIgnoreCase(request.method()) && "/chat".equals(request.path())) {
                 String message = stringValue(body, "message");
                 if (message.startsWith("/")) {
@@ -132,9 +149,7 @@ public final class ControlHttpServer {
             if ("POST".equalsIgnoreCase(request.method()) && "/tap".equals(request.path())) {
                 String key = stringValue(body, "key");
                 int durationMs = intValue(body, "durationMs", 120);
-                if (durationMs < 10 || durationMs > 10_000) {
-                    throw new IllegalArgumentException("durationMs must be between 10 and 10000");
-                }
+                validateDuration(durationMs, 10, 10_000, "durationMs");
 
                 bridge.setKey(key, true);
                 scheduler.schedule(() -> {
@@ -201,6 +216,44 @@ public final class ControlHttpServer {
                 bridge.guiClickWidget(intValue(body, "index", -1), intValue(body, "button", 0));
                 return jsonResponse(200, okPayload("clicked"));
             }
+            if ("POST".equalsIgnoreCase(request.method()) && "/screenshot".equals(request.path())) {
+                return jsonResponse(200, bridge.takeScreenshot(optionalStringValue(body, "name")));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/sequence".equals(request.path())) {
+                return jsonResponse(200, executeSequence(body));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/debug/fake-player/spawn".equals(request.path())) {
+                return jsonResponse(200, bridge.spawnDebugFakePlayer(
+                    stringValue(body, "name"),
+                    doubleObjectValue(body, "x"),
+                    doubleObjectValue(body, "y"),
+                    doubleObjectValue(body, "z"),
+                    floatValue(body, "yaw"),
+                    floatValue(body, "pitch"),
+                    booleanObjectValue(body, "invisible"),
+                    booleanObjectValue(body, "noGravity"),
+                    booleanObjectValue(body, "nameVisible")
+                ));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/debug/fake-player/move".equals(request.path())) {
+                return jsonResponse(200, bridge.moveDebugFakePlayer(
+                    stringValue(body, "name"),
+                    doubleObjectValue(body, "x"),
+                    doubleObjectValue(body, "y"),
+                    doubleObjectValue(body, "z"),
+                    floatValue(body, "yaw"),
+                    floatValue(body, "pitch"),
+                    booleanObjectValue(body, "invisible"),
+                    booleanObjectValue(body, "noGravity"),
+                    booleanObjectValue(body, "nameVisible")
+                ));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/debug/fake-player/remove".equals(request.path())) {
+                return jsonResponse(200, bridge.removeDebugFakePlayer(stringValue(body, "name")));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/debug/fake-player/clear".equals(request.path())) {
+                return jsonResponse(200, bridge.clearDebugFakePlayers());
+            }
 
             return jsonResponse(404, errorPayload("route not found"));
         } catch (IllegalArgumentException | IllegalStateException exception) {
@@ -213,6 +266,176 @@ public final class ControlHttpServer {
             logger.log(Level.WARNING, "Control request failed", throwable);
             return jsonResponse(500, errorPayload(throwable.getMessage() == null ? throwable.toString() : throwable.getMessage()));
         }
+    }
+
+    private Map<String, Object> executeSequence(JsonObject body) throws Exception {
+        JsonArray steps = requiredArrayValue(body, "steps");
+        List<Map<String, Object>> results = new ArrayList<>();
+
+        for (int index = 0; index < steps.size(); index++) {
+            JsonElement element = steps.get(index);
+            if (!element.isJsonObject()) {
+                throw new IllegalArgumentException("steps[" + index + "] must be an object");
+            }
+            results.add(executeSequenceStep(index, element.getAsJsonObject()));
+        }
+
+        Map<String, Object> payload = okPayload("executed");
+        payload.put("executed", results.size());
+        payload.put("results", results);
+        return payload;
+    }
+
+    private Map<String, Object> executeSequenceStep(int index, JsonObject step) throws Exception {
+        String action = stringValue(step, "action");
+        return switch (action) {
+            case "wait" -> waitStep(index, step);
+            case "look" -> lookStep(index, step);
+            case "key" -> keyStep(index, step);
+            case "tap" -> tapStep(index, step);
+            case "hotbar" -> hotbarStep(index, step);
+            case "chat" -> chatStep(index, step);
+            case "command" -> commandStep(index, step);
+            case "release-all", "releaseAll" -> releaseAllStep(index);
+            case "move" -> moveStep(index, step);
+            case "gui.click" -> guiClickStep(index, step);
+            case "gui.release" -> guiReleaseStep(index, step);
+            case "gui.scroll" -> guiScrollStep(index, step);
+            case "gui.key" -> guiKeyStep(index, step);
+            case "gui.type" -> guiTypeStep(index, step);
+            case "gui.clickWidget" -> guiClickWidgetStep(index, step);
+            case "screenshot" -> screenshotStep(index, step);
+            default -> throw new IllegalArgumentException("unsupported sequence action: " + action);
+        };
+    }
+
+    private Map<String, Object> waitStep(int index, JsonObject step) throws InterruptedException {
+        int durationMs = intValue(step, "durationMs", 0);
+        validateDuration(durationMs, 0, 600_000, "durationMs");
+        Thread.sleep(durationMs);
+        Map<String, Object> payload = stepPayload(index, "wait");
+        payload.put("durationMs", durationMs);
+        return payload;
+    }
+
+    private Map<String, Object> lookStep(int index, JsonObject step) throws Exception {
+        bridge.setLook(floatValue(step, "yaw"), floatValue(step, "pitch"), floatValue(step, "deltaYaw"), floatValue(step, "deltaPitch"));
+        return stepPayload(index, "look");
+    }
+
+    private Map<String, Object> keyStep(int index, JsonObject step) throws Exception {
+        bridge.setKey(stringValue(step, "key"), booleanValue(step, "state", false));
+        return stepPayload(index, "key");
+    }
+
+    private Map<String, Object> tapStep(int index, JsonObject step) throws Exception {
+        String key = stringValue(step, "key");
+        int durationMs = intValue(step, "durationMs", 120);
+        validateDuration(durationMs, 10, 10_000, "durationMs");
+        bridge.setKey(key, true);
+        Thread.sleep(durationMs);
+        bridge.setKey(key, false);
+        Map<String, Object> payload = stepPayload(index, "tap");
+        payload.put("key", key);
+        payload.put("durationMs", durationMs);
+        return payload;
+    }
+
+    private Map<String, Object> hotbarStep(int index, JsonObject step) throws Exception {
+        bridge.setHotbarSlot(requiredIntValue(step, "slot"));
+        return stepPayload(index, "hotbar");
+    }
+
+    private Map<String, Object> chatStep(int index, JsonObject step) throws Exception {
+        bridge.sendChat(stringValue(step, "message"));
+        return stepPayload(index, "chat");
+    }
+
+    private Map<String, Object> commandStep(int index, JsonObject step) throws Exception {
+        bridge.sendCommand(stringValue(step, "command"));
+        return stepPayload(index, "command");
+    }
+
+    private Map<String, Object> releaseAllStep(int index) throws Exception {
+        bridge.releaseAllMovementKeys();
+        return stepPayload(index, "release-all");
+    }
+
+    private Map<String, Object> moveStep(int index, JsonObject step) throws Exception {
+        if (step.has("yaw") || step.has("pitch") || step.has("deltaYaw") || step.has("deltaPitch")) {
+            bridge.setLook(floatValue(step, "yaw"), floatValue(step, "pitch"), floatValue(step, "deltaYaw"), floatValue(step, "deltaPitch"));
+        }
+
+        List<String> pressedKeys = new ArrayList<>();
+        for (String key : MOVEMENT_SEQUENCE_KEYS) {
+            if (!step.has(key)) {
+                continue;
+            }
+            boolean state = step.get(key).getAsBoolean();
+            bridge.setKey(key, state);
+            if (state) {
+                pressedKeys.add(key);
+            }
+        }
+
+        int durationMs = intValue(step, "durationMs", 0);
+        validateDuration(durationMs, 0, 600_000, "durationMs");
+        if (durationMs > 0) {
+            Thread.sleep(durationMs);
+        }
+
+        for (String key : pressedKeys) {
+            bridge.setKey(key, false);
+        }
+
+        Map<String, Object> payload = stepPayload(index, "move");
+        payload.put("durationMs", durationMs);
+        payload.put("keys", pressedKeys);
+        return payload;
+    }
+
+    private Map<String, Object> guiClickStep(int index, JsonObject step) throws Exception {
+        bridge.guiClick(requiredDoubleValue(step, "x"), requiredDoubleValue(step, "y"), intValue(step, "button", 0), booleanValue(step, "doubleClick", false));
+        return stepPayload(index, "gui.click");
+    }
+
+    private Map<String, Object> guiReleaseStep(int index, JsonObject step) throws Exception {
+        bridge.guiRelease(requiredDoubleValue(step, "x"), requiredDoubleValue(step, "y"), intValue(step, "button", 0));
+        return stepPayload(index, "gui.release");
+    }
+
+    private Map<String, Object> guiScrollStep(int index, JsonObject step) throws Exception {
+        bridge.guiScroll(requiredDoubleValue(step, "x"), requiredDoubleValue(step, "y"), doubleValue(step, "deltaX", 0.0D), doubleValue(step, "deltaY", 0.0D));
+        return stepPayload(index, "gui.scroll");
+    }
+
+    private Map<String, Object> guiKeyStep(int index, JsonObject step) throws Exception {
+        bridge.guiKeyPress(requiredIntValue(step, "key"), intValue(step, "scancode", 0), intValue(step, "modifiers", 0));
+        return stepPayload(index, "gui.key");
+    }
+
+    private Map<String, Object> guiTypeStep(int index, JsonObject step) throws Exception {
+        bridge.guiType(stringValue(step, "text"));
+        return stepPayload(index, "gui.type");
+    }
+
+    private Map<String, Object> guiClickWidgetStep(int index, JsonObject step) throws Exception {
+        bridge.guiClickWidget(requiredIntValue(step, "index"), intValue(step, "button", 0));
+        return stepPayload(index, "gui.clickWidget");
+    }
+
+    private Map<String, Object> screenshotStep(int index, JsonObject step) throws Exception {
+        Map<String, Object> payload = stepPayload(index, "screenshot");
+        payload.put("result", bridge.takeScreenshot(optionalStringValue(step, "name")));
+        return payload;
+    }
+
+    private static Map<String, Object> stepPayload(int index, String action) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("index", index);
+        payload.put("action", action);
+        payload.put("ok", Boolean.TRUE);
+        return payload;
     }
 
     private void requireToken(HttpRequest request, JsonObject body) {
@@ -255,9 +478,23 @@ public final class ControlHttpServer {
         return body.get(key).getAsString();
     }
 
+    private static String optionalStringValue(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
+            return null;
+        }
+        return body.get(key).getAsString();
+    }
+
     private static boolean booleanValue(JsonObject body, String key, boolean fallback) {
         if (!body.has(key)) {
             return fallback;
+        }
+        return body.get(key).getAsBoolean();
+    }
+
+    private static Boolean booleanObjectValue(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
+            return null;
         }
         return body.get(key).getAsBoolean();
     }
@@ -277,7 +514,7 @@ public final class ControlHttpServer {
     }
 
     private static Float floatValue(JsonObject body, String key) {
-        if (!body.has(key)) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
             return null;
         }
         return body.get(key).getAsFloat();
@@ -290,11 +527,31 @@ public final class ControlHttpServer {
         return body.get(key).getAsDouble();
     }
 
+    private static Double doubleObjectValue(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
+            return null;
+        }
+        return body.get(key).getAsDouble();
+    }
+
     private static double requiredDoubleValue(JsonObject body, String key) {
         if (!body.has(key)) {
             throw new IllegalArgumentException("missing field: " + key);
         }
         return body.get(key).getAsDouble();
+    }
+
+    private static JsonArray requiredArrayValue(JsonObject body, String key) {
+        if (!body.has(key) || !body.get(key).isJsonArray()) {
+            throw new IllegalArgumentException("missing array field: " + key);
+        }
+        return body.getAsJsonArray(key);
+    }
+
+    private static void validateDuration(int durationMs, int min, int max, String label) {
+        if (durationMs < min || durationMs > max) {
+            throw new IllegalArgumentException(label + " must be between " + min + " and " + max);
+        }
     }
 
     private static String queryValue(String query, String key) {
@@ -339,6 +596,10 @@ public final class ControlHttpServer {
             "GET /status",
             "GET /chat",
             "GET /screen",
+            "GET /target",
+            "GET /container",
+            "GET /players",
+            "GET /debug/fake-player",
             "POST /chat",
             "POST /command",
             "POST /look",
@@ -352,7 +613,13 @@ public final class ControlHttpServer {
             "POST /gui/scroll",
             "POST /gui/key",
             "POST /gui/type",
-            "POST /gui/click-widget"
+            "POST /gui/click-widget",
+            "POST /screenshot",
+            "POST /sequence",
+            "POST /debug/fake-player/spawn",
+            "POST /debug/fake-player/move",
+            "POST /debug/fake-player/remove",
+            "POST /debug/fake-player/clear"
         });
         return payload;
     }

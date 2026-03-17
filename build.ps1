@@ -5,10 +5,11 @@ $BuildDir = Join-Path $ProjectRoot "build"
 $ClassesDir = Join-Path $BuildDir "classes"
 $StageDir = Join-Path $BuildDir "stage"
 $OutputJar = Join-Path $BuildDir "codex-client-control-1.0.0+1.21.11.jar"
-$InstallDir = Join-Path $ProjectRoot "..\\versions\\1.21.11far\\mods"
+$MinecraftRoot = Resolve-Path (Join-Path $ProjectRoot "..\\..")
+$InstallDir = Join-Path $MinecraftRoot "versions\\1.21.11far\\mods"
 
-$LoaderJar = Join-Path $ProjectRoot "..\\libraries\\net\\fabricmc\\fabric-loader\\0.18.4\\fabric-loader-0.18.4.jar"
-$GsonJar = Join-Path $ProjectRoot "..\\libraries\\com\\google\\code\\gson\\gson\\2.13.2\\gson-2.13.2.jar"
+$LoaderJar = Join-Path $MinecraftRoot "libraries\\net\\fabricmc\\fabric-loader\\0.18.4\\fabric-loader-0.18.4.jar"
+$GsonJar = Join-Path $MinecraftRoot "libraries\\com\\google\\code\\gson\\gson\\2.13.2\\gson-2.13.2.jar"
 
 if (-not (Test-Path $LoaderJar)) {
     throw "Missing Fabric Loader jar: $LoaderJar"

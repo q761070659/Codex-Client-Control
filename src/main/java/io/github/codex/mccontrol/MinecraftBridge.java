@@ -1,4 +1,4 @@
-﻿package io.github.codex.mccontrol;
+package io.github.codex.mccontrol;
 
 import java.io.File;
 import java.io.IOException;
@@ -981,3 +981,357 @@ public final class MinecraftBridge {
         payload.put("widgets", widgets);
         return payload;
     }
+
+    private Map<String, Object> blockHitSummary(Object blockHitResult) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        Object blockPos = blockHitResultGetBlockPosMethod.invoke(blockHitResult);
+        payload.put("position", blockPosToMap(blockPos));
+        payload.put("direction", String.valueOf(blockHitResultGetDirectionMethod.invoke(blockHitResult)));
+        return payload;
+    }
+
+    private Map<String, Object> playerInfoSummary(Object playerInfo) throws ReflectiveOperationException {
+        Object profile = playerInfoGetProfileMethod.invoke(playerInfo);
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("name", String.valueOf(gameProfileGetNameMethod.invoke(profile)));
+        payload.put("uuid", String.valueOf(gameProfileGetIdMethod.invoke(profile)));
+        payload.put("latency", invokeInt(playerInfoGetLatencyMethod, playerInfo));
+        payload.put("gameMode", String.valueOf(playerInfoGetGameModeMethod.invoke(playerInfo)));
+        payload.put("displayName", componentToString(playerInfoGetTabListDisplayNameMethod.invoke(playerInfo)));
+        return payload;
+    }
+
+    private Map<String, Object> entitySummary(Object entity) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("id", invokeInt(entityGetIdMethod, entity));
+        payload.put("uuid", String.valueOf(entityGetUuidMethod.invoke(entity)));
+        payload.put("name", componentToString(entityGetNameMethod.invoke(entity)));
+        payload.put("className", entity.getClass().getName());
+        payload.put("x", invokeDouble(entityGetXMethod, entity));
+        payload.put("y", invokeDouble(entityGetYMethod, entity));
+        payload.put("z", invokeDouble(entityGetZMethod, entity));
+        payload.put("yaw", invokeFloat(entityGetYawMethod, entity));
+        payload.put("pitch", invokeFloat(entityGetPitchMethod, entity));
+        return payload;
+    }
+
+    private Map<String, Object> debugFakePlayerSummary(DebugFakePlayer debugFakePlayer, Object entity) throws ReflectiveOperationException {
+        Map<String, Object> payload = entitySummary(entity);
+        payload.put("debugName", debugFakePlayer.name());
+        payload.put("localOnly", Boolean.TRUE);
+        return payload;
+    }
+
+    private Map<String, Object> itemStackSummary(Object itemStack) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        if (itemStack == null || (Boolean) itemStackIsEmptyMethod.invoke(itemStack)) {
+            payload.put("empty", Boolean.TRUE);
+            payload.put("count", 0);
+            payload.put("name", "");
+            payload.put("itemClassName", "");
+            return payload;
+        }
+
+        Object item = itemStackGetItemMethod.invoke(itemStack);
+        payload.put("empty", Boolean.FALSE);
+        payload.put("count", invokeInt(itemStackGetCountMethod, itemStack));
+        payload.put("name", componentToString(itemStackGetHoverNameMethod.invoke(itemStack)));
+        payload.put("itemClassName", item == null ? "" : item.getClass().getName());
+        return payload;
+    }
+
+    private Map<String, Object> vec3ToMap(Object vec3) throws IllegalAccessException {
+        if (vec3 == null) {
+            return Map.of("x", 0.0D, "y", 0.0D, "z", 0.0D);
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("x", ((Number) vec3XField.get(vec3)).doubleValue());
+        payload.put("y", ((Number) vec3YField.get(vec3)).doubleValue());
+        payload.put("z", ((Number) vec3ZField.get(vec3)).doubleValue());
+        return payload;
+    }
+
+    private Map<String, Object> blockPosToMap(Object blockPos) throws ReflectiveOperationException {
+        long packed = ((Number) blockPosAsLongMethod.invoke(blockPos)).longValue();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("x", ((Number) blockPosGetXMethod.invoke(null, packed)).intValue());
+        payload.put("y", ((Number) blockPosGetYMethod.invoke(null, packed)).intValue());
+        payload.put("z", ((Number) blockPosGetZMethod.invoke(null, packed)).intValue());
+        return payload;
+    }
+
+    private Path resolveScreenshotPath(Path screenshotDirectory, String requestedName, long startedAt) {
+        Path exactPath = screenshotDirectory.resolve(requestedName);
+        if (Files.exists(exactPath)) {
+            return exactPath;
+        }
+
+        if (!requestedName.toLowerCase(Locale.ROOT).endsWith(".png")) {
+            Path pngPath = screenshotDirectory.resolve(requestedName + ".png");
+            if (Files.exists(pngPath)) {
+                return pngPath;
+            }
+        }
+
+        String prefix = requestedName.toLowerCase(Locale.ROOT).endsWith(".png")
+            ? requestedName.substring(0, requestedName.length() - 4)
+            : requestedName;
+
+        try (Stream<Path> paths = Files.list(screenshotDirectory)) {
+            return paths
+                .filter(Files::isRegularFile)
+                .filter(path -> path.getFileName().toString().startsWith(prefix))
+                .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".png"))
+                .filter(path -> {
+                    try {
+                        return Files.getLastModifiedTime(path).toMillis() >= startedAt - 1_000L;
+                    } catch (IOException ignored) {
+                        return false;
+                    }
+                })
+                .max(Comparator.comparingLong(path -> {
+                    try {
+                        return Files.getLastModifiedTime(path).toMillis();
+                    } catch (IOException ignored) {
+                        return Long.MIN_VALUE;
+                    }
+                }))
+                .orElse(exactPath);
+        } catch (IOException ignored) {
+            return exactPath;
+        }
+    }
+
+    private void setEntityPosition(Object entity, double x, double y, double z) throws ReflectiveOperationException {
+        if (entitySetPosRawMethod != null) {
+            entitySetPosRawMethod.invoke(entity, x, y, z);
+        }
+        entitySetPosMethod.invoke(entity, x, y, z);
+    }
+
+    private Object requireLevel() throws ReflectiveOperationException {
+        Object level = minecraftLevelField.get(getMinecraft());
+        if (level == null) {
+            throw new IllegalStateException("level is not available");
+        }
+        return level;
+    }
+
+    private DebugFakePlayer requireDebugFakePlayer(String name) {
+        DebugFakePlayer debugFakePlayer = debugFakePlayers.get(name);
+        if (debugFakePlayer == null) {
+            throw new IllegalArgumentException("fake player not found: " + name);
+        }
+        return debugFakePlayer;
+    }
+
+    private Object requireDebugFakePlayerEntity(DebugFakePlayer debugFakePlayer) throws ReflectiveOperationException {
+        Object level = requireLevel();
+        Object entity = clientLevelGetEntityMethod.invoke(level, debugFakePlayer.entityId());
+        if (entity == null) {
+            debugFakePlayers.remove(debugFakePlayer.name());
+            throw new IllegalStateException("fake player entity is no longer available");
+        }
+        return entity;
+    }
+
+    private boolean isVisibleWidget(Object widget) throws IllegalAccessException {
+        return (Boolean) widgetVisibleField.get(widget);
+    }
+
+    private String componentToString(Object component) throws ReflectiveOperationException {
+        if (component == null) {
+            return "";
+        }
+        return (String) componentGetStringMethod.invoke(component);
+    }
+
+    private String tagToString(Object tag) throws ReflectiveOperationException {
+        if (tag == null) {
+            return "";
+        }
+        if (guiMessageTagLogTagField != null) {
+            Object value = guiMessageTagLogTagField.get(tag);
+            return value == null ? "" : value.toString();
+        }
+        return tag.toString();
+    }
+
+    private Object requirePlayer() throws ReflectiveOperationException {
+        Object minecraft = getMinecraft();
+        Object player = minecraftPlayerField.get(minecraft);
+        if (player == null) {
+            throw new IllegalStateException("player is not available");
+        }
+        return player;
+    }
+
+    private Object requireScreen() throws ReflectiveOperationException {
+        Object minecraft = getMinecraft();
+        Object screen = minecraftScreenField.get(minecraft);
+        if (screen == null) {
+            throw new IllegalStateException("no screen is currently open");
+        }
+        return screen;
+    }
+
+    private Object newMouseButtonEvent(double x, double y, int button, int modifiers) throws ReflectiveOperationException {
+        Object info = mouseButtonInfoClass.getDeclaredConstructor(int.class, int.class).newInstance(button, modifiers);
+        return mouseButtonEventClass.getDeclaredConstructor(double.class, double.class, mouseButtonInfoClass).newInstance(x, y, info);
+    }
+
+    private Object resolveKeyMapping(String fieldName) throws ReflectiveOperationException {
+        Object minecraft = getMinecraft();
+        Object options = minecraftOptionsField.get(minecraft);
+        Field field = findField(optionsClass, fieldName);
+        return field.get(options);
+    }
+
+    private Object getMinecraft() throws ReflectiveOperationException {
+        return getMinecraftInstanceMethod.invoke(null);
+    }
+
+    private <T> T onClientThread(ReflectiveCallable<T> callable) throws ReflectiveOperationException {
+        Object minecraft = getMinecraft();
+        if (!(minecraft instanceof Executor executor)) {
+            throw new IllegalStateException("minecraft is not an executor");
+        }
+
+        CompletableFuture<T> future = new CompletableFuture<>();
+        executor.execute(() -> {
+            try {
+                future.complete(callable.call());
+            } catch (Throwable throwable) {
+                future.completeExceptionally(throwable);
+            }
+        });
+
+        try {
+            return future.get();
+        } catch (InterruptedException interruptedException) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while waiting for client thread", interruptedException);
+        } catch (ExecutionException executionException) {
+            Throwable cause = executionException.getCause();
+            if (cause instanceof ReflectiveOperationException reflectiveOperationException) {
+                throw reflectiveOperationException;
+            }
+            if (cause instanceof InvocationTargetException invocationTargetException && invocationTargetException.getCause() instanceof ReflectiveOperationException reflectiveOperationException) {
+                throw reflectiveOperationException;
+            }
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("client task failed", cause);
+        }
+    }
+
+    private static String normalizeMessage(String value, String label) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(label + " must not be empty");
+        }
+        return value.strip();
+    }
+
+    private static String normalizeFakePlayerName(String name) {
+        String normalized = normalizeMessage(name, "name");
+        if (normalized.length() > 32) {
+            throw new IllegalArgumentException("name must be at most 32 characters");
+        }
+        return normalized;
+    }
+
+    private static String normalizeScreenshotName(String requestedName) {
+        String base = requestedName == null || requestedName.isBlank()
+            ? "codex-" + System.currentTimeMillis()
+            : requestedName.strip();
+        base = base.replace('\\', '_').replace('/', '_').replace(':', '_');
+        base = base.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (base.isBlank()) {
+            base = "codex-" + System.currentTimeMillis();
+        }
+        return base;
+    }
+
+    private static String optionKeyFieldName(String keyName) {
+        Objects.requireNonNull(keyName, "keyName");
+        return switch (keyName.toLowerCase(Locale.ROOT)) {
+            case "forward", "up", "w" -> "s";
+            case "left", "a" -> "t";
+            case "back", "down", "backward", "s_key" -> "u";
+            case "right", "d" -> "v";
+            case "jump", "space" -> "w";
+            case "sneak", "shift", "crouch" -> "x";
+            case "sprint", "run" -> "y";
+            case "inventory", "inv", "e" -> "z";
+            case "use", "interact", "right_click" -> "C";
+            case "attack", "left_click", "mine" -> "D";
+            case "pick", "pick_item", "middle_click" -> "E";
+            case "chat", "t" -> "F";
+            default -> throw new IllegalArgumentException("unsupported key: " + keyName);
+        };
+    }
+
+    private static Field findField(Class<?> owner, String name) throws ReflectiveOperationException {
+        Field field = owner.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+    }
+
+    private static Field findOptionalField(String ownerClassName, String name) {
+        try {
+            Field field = Class.forName(ownerClassName).getDeclaredField(name);
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
+    }
+
+    private static Method findMethod(Class<?> owner, String name, Class<?>... parameterTypes) throws ReflectiveOperationException {
+        Method method = owner.getDeclaredMethod(name, parameterTypes);
+        method.setAccessible(true);
+        return method;
+    }
+
+    private static Method findOptionalMethod(Class<?> owner, String name, Class<?>... parameterTypes) {
+        try {
+            Method method = owner.getDeclaredMethod(name, parameterTypes);
+            method.setAccessible(true);
+            return method;
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
+    }
+
+    private static Method findAccessibleMethod(Class<?> owner, String name, Class<?>... parameterTypes) throws ReflectiveOperationException {
+        Method method = owner.getMethod(name, parameterTypes);
+        method.setAccessible(true);
+        return method;
+    }
+
+    private static double invokeDouble(Method method, Object target) throws ReflectiveOperationException {
+        return ((Number) method.invoke(target)).doubleValue();
+    }
+
+    private static float invokeFloat(Method method, Object target) throws ReflectiveOperationException {
+        return ((Number) method.invoke(target)).floatValue();
+    }
+
+    private static int invokeInt(Method method, Object target) throws ReflectiveOperationException {
+        return ((Number) method.invoke(target)).intValue();
+    }
+
+    @FunctionalInterface
+    private interface ReflectiveCallable<T> {
+        T call() throws Exception;
+    }
+
+    private record DebugFakePlayer(String name, UUID uuid, int entityId) {
+    }
+}
