@@ -76,7 +76,18 @@ foreach ($pair in @(
     if (Test-Path $ZipPath) {
         Remove-Item $ZipPath -Force
     }
-    Compress-Archive -Path (Join-Path $pair.Stage "*") -DestinationPath $ZipPath
+    @"
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+
+stage = Path(r"$($pair.Stage)")
+target = Path(r"$ZipPath")
+
+with ZipFile(target, "w", compression=ZIP_DEFLATED) as archive:
+    for path in sorted(stage.rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(stage).as_posix())
+"@ | python -
     Move-Item -Force $ZipPath $pair.Jar
 
     New-Item -ItemType Directory -Force -Path $pair.Install | Out-Null
