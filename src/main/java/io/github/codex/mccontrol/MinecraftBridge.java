@@ -27,6 +27,8 @@ import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 public final class MinecraftBridge {
+    private static final String[] MOVEMENT_KEYS = { "forward", "back", "left", "right", "jump", "sneak", "sprint", "use", "attack" };
+
     private final ChatHistory chatHistory = new ChatHistory();
     private final Map<String, DebugFakePlayer> debugFakePlayers = new LinkedHashMap<>();
 
@@ -74,6 +76,7 @@ public final class MinecraftBridge {
 
     private final Method getMinecraftInstanceMethod;
     private final Method keySetDownMethod;
+    private final Method keyClickMethod;
     private final Method sendChatMethod;
     private final Method sendCommandMethod;
     private final Method entityGetXMethod;
@@ -165,6 +168,7 @@ public final class MinecraftBridge {
     private final Field minecraftHitResultField;
     private final Field minecraftMainRenderTargetField;
     private final Field localPlayerConnectionField;
+    private final Field keyMappingKeyField;
     private final Field playerInventoryField;
     private final Field chatAllMessagesField;
     private final Field chatRecentMessagesField;
@@ -191,165 +195,168 @@ public final class MinecraftBridge {
     private final Object entityDiscardedRemovalReason;
 
     public MinecraftBridge() throws ReflectiveOperationException {
-        minecraftClass = Class.forName("gfj");
-        guiClass = Class.forName("giq");
-        chatComponentClass = Class.forName("gjf");
-        guiMessageClass = Class.forName("gfc");
-        componentClass = Class.forName("yh");
-        optionsClass = Class.forName("gfo");
-        keyMappingClass = Class.forName("gfh");
-        localPlayerClass = Class.forName("hnh");
-        packetListenerClass = Class.forName("hig");
-        gameModeClass = Class.forName("hio");
-        entityClass = Class.forName("cgk");
-        livingEntityClass = Class.forName("chl");
-        playerClass = Class.forName("ddm");
-        inventoryClass = Class.forName("ddl");
-        foodDataClass = Class.forName("dhe");
-        screenClass = Class.forName("gsb");
-        guiEventListenerClass = Class.forName("gmm");
-        abstractWidgetClass = Class.forName("gjc");
-        editBoxClass = Class.forName("gjn");
-        keyEventClass = Class.forName("gzb");
-        characterEventClass = Class.forName("gyy");
-        mouseButtonInfoClass = Class.forName("gzd");
-        mouseButtonEventClass = Class.forName("gzc");
-        abstractContainerScreenClass = Class.forName("gti");
-        abstractContainerMenuClass = Class.forName("dhi");
-        slotClass = Class.forName("dji");
-        itemStackClass = Class.forName("dlt");
-        hitResultClass = Class.forName("ftk");
-        blockHitResultClass = Class.forName("fti");
-        entityHitResultClass = Class.forName("ftj");
-        vec3Class = Class.forName("ftm");
-        blockPosClass = Class.forName("is");
-        playerInfoClass = Class.forName("hiq");
-        clientLevelClass = Class.forName("hif");
-        remotePlayerClass = Class.forName("hnj");
-        gameProfileClass = Class.forName("com.mojang.authlib.GameProfile");
-        screenshotClass = Class.forName("gfs");
-        entityRemovalReasonClass = Class.forName("cgk$e");
+        minecraftClass = findClass("net.minecraft.client.Minecraft", "gfj");
+        guiClass = findClass("net.minecraft.client.gui.Gui", "giq");
+        chatComponentClass = findClass("net.minecraft.client.gui.components.ChatComponent", "gjf");
+        guiMessageClass = findClass("net.minecraft.client.GuiMessage", "gfc");
+        componentClass = findClass("net.minecraft.network.chat.Component", "yh");
+        optionsClass = findClass("net.minecraft.client.Options", "gfo");
+        keyMappingClass = findClass("net.minecraft.client.KeyMapping", "gfh");
+        localPlayerClass = findClass("net.minecraft.client.player.LocalPlayer", "hnh");
+        packetListenerClass = findClass("net.minecraft.client.multiplayer.ClientPacketListener", "hig");
+        gameModeClass = findClass("net.minecraft.client.multiplayer.MultiPlayerGameMode", "hio");
+        entityClass = findClass("net.minecraft.world.entity.Entity", "cgk");
+        livingEntityClass = findClass("net.minecraft.world.entity.LivingEntity", "chl");
+        playerClass = findClass("net.minecraft.world.entity.player.Player", "ddm");
+        inventoryClass = findClass("net.minecraft.world.entity.player.Inventory", "ddl");
+        foodDataClass = findClass("net.minecraft.world.food.FoodData", "dhe");
+        screenClass = findClass("net.minecraft.client.gui.screens.Screen", "gsb");
+        guiEventListenerClass = findClass("net.minecraft.client.gui.components.events.GuiEventListener", "gmm");
+        abstractWidgetClass = findClass("net.minecraft.client.gui.components.AbstractWidget", "gjc");
+        editBoxClass = findClass("net.minecraft.client.gui.components.EditBox", "gjn");
+        keyEventClass = findClass("net.minecraft.client.input.KeyEvent", "gzb");
+        characterEventClass = findClass("net.minecraft.client.input.CharacterEvent", "gyy");
+        mouseButtonInfoClass = findClass("net.minecraft.client.input.MouseButtonInfo", "gzd");
+        mouseButtonEventClass = findClass("net.minecraft.client.input.MouseButtonEvent", "gzc");
+        abstractContainerScreenClass = findClass("net.minecraft.client.gui.screens.inventory.AbstractContainerScreen", "gti");
+        abstractContainerMenuClass = findClass("net.minecraft.world.inventory.AbstractContainerMenu", "dhi");
+        slotClass = findClass("net.minecraft.world.inventory.Slot", "dji");
+        itemStackClass = findClass("net.minecraft.world.item.ItemStack", "dlt");
+        hitResultClass = findClass("net.minecraft.world.phys.HitResult", "ftk");
+        blockHitResultClass = findClass("net.minecraft.world.phys.BlockHitResult", "fti");
+        entityHitResultClass = findClass("net.minecraft.world.phys.EntityHitResult", "ftj");
+        vec3Class = findClass("net.minecraft.world.phys.Vec3", "ftm");
+        blockPosClass = findClass("net.minecraft.core.BlockPos", "is");
+        playerInfoClass = findClass("net.minecraft.client.multiplayer.PlayerInfo", "hiq");
+        clientLevelClass = findClass("net.minecraft.client.multiplayer.ClientLevel", "hif");
+        remotePlayerClass = findClass("net.minecraft.client.player.RemotePlayer", "hnj");
+        gameProfileClass = findClass("com.mojang.authlib.GameProfile");
+        screenshotClass = findClass("net.minecraft.client.Screenshot", "gfs");
+        entityRemovalReasonClass = findClass("net.minecraft.world.entity.Entity$RemovalReason", "cgk$e");
+        Class<?> guiMessageTagClass = findClass("net.minecraft.client.GuiMessageTag", "gfd");
 
-        minecraftGameDirectoryField = findField(minecraftClass, "p");
-        minecraftOptionsField = findField(minecraftClass, "k");
-        minecraftPlayerField = findField(minecraftClass, "s");
-        minecraftGameModeField = findField(minecraftClass, "q");
-        minecraftScreenField = findField(minecraftClass, "x");
-        minecraftGuiField = findField(minecraftClass, "j");
-        minecraftLevelField = findField(minecraftClass, "r");
-        minecraftHitResultField = findField(minecraftClass, "u");
-        minecraftMainRenderTargetField = findField(minecraftClass, "an");
+        minecraftGameDirectoryField = findFieldAny(minecraftClass, "gameDirectory", "p");
+        minecraftOptionsField = findFieldAny(minecraftClass, "options", "k");
+        minecraftPlayerField = findFieldAny(minecraftClass, "player", "s");
+        minecraftGameModeField = findFieldAny(minecraftClass, "gameMode", "q");
+        minecraftScreenField = findFieldAny(minecraftClass, "screen", "x");
+        minecraftGuiField = findFieldAny(minecraftClass, "gui", "j");
+        minecraftLevelField = findFieldAny(minecraftClass, "level", "r");
+        minecraftHitResultField = findFieldAny(minecraftClass, "hitResult", "u");
+        minecraftMainRenderTargetField = findFieldAny(minecraftClass, "mainRenderTarget", "an");
         renderTargetClass = minecraftMainRenderTargetField.getType();
 
-        getMinecraftInstanceMethod = findMethod(minecraftClass, "V");
-        keySetDownMethod = findMethod(keyMappingClass, "a", boolean.class);
-        sendChatMethod = findMethod(packetListenerClass, "c", String.class);
-        sendCommandMethod = findMethod(packetListenerClass, "d", String.class);
-        entityGetXMethod = findMethod(entityClass, "dP");
-        entityGetYMethod = findMethod(entityClass, "dR");
-        entityGetZMethod = findMethod(entityClass, "dV");
-        entityGetYawMethod = findMethod(entityClass, "ec");
-        entityGetPitchMethod = findMethod(entityClass, "ee");
-        entitySetYawMethod = findMethod(entityClass, "v", float.class);
-        entitySetPitchMethod = findMethod(entityClass, "w", float.class);
-        livingGetHealthMethod = findMethod(livingEntityClass, "eZ");
-        livingGetMaxHealthMethod = findMethod(livingEntityClass, "fq");
-        playerGetFoodDataMethod = findMethod(playerClass, "gW");
-        foodDataGetFoodLevelMethod = findMethod(foodDataClass, "a");
-        foodDataGetSaturationMethod = findMethod(foodDataClass, "d");
-        inventorySetSelectedSlotMethod = findMethod(inventoryClass, "d", int.class);
-        inventoryGetSelectedSlotMethod = findMethod(inventoryClass, "g");
-        gameModeSyncSelectedSlotMethod = findMethod(gameModeClass, "l");
-        guiGetChatMethod = findMethod(guiClass, "e");
-        componentGetStringMethod = findMethod(componentClass, "getString");
-        componentLiteralMethod = findMethod(componentClass, "b", String.class);
-        screenGetTitleMethod = findMethod(screenClass, "q");
-        screenShouldCloseOnEscMethod = findMethod(screenClass, "aY_");
-        screenOnCloseMethod = findMethod(screenClass, "aX_");
-        screenInsertTextMethod = findMethod(screenClass, "a_", String.class, boolean.class);
-        widgetGetMessageMethod = findMethod(abstractWidgetClass, "B");
-        widgetIsActiveMethod = findMethod(abstractWidgetClass, "b");
-        widgetGetXMethod = findMethod(abstractWidgetClass, "aT_");
-        widgetGetYMethod = findMethod(abstractWidgetClass, "aU_");
-        widgetGetWidthMethod = findMethod(abstractWidgetClass, "aS_");
-        widgetGetHeightMethod = findMethod(abstractWidgetClass, "aR_");
-        editBoxGetValueMethod = findMethod(editBoxClass, "a");
-        guiMouseClickedMethod = findMethod(guiEventListenerClass, "a", mouseButtonEventClass, boolean.class);
-        guiMouseReleasedMethod = findMethod(guiEventListenerClass, "b", mouseButtonEventClass);
-        guiMouseScrolledMethod = findMethod(guiEventListenerClass, "a", double.class, double.class, double.class, double.class);
-        guiKeyPressedMethod = findMethod(guiEventListenerClass, "a", keyEventClass);
-        guiCharTypedMethod = findMethod(guiEventListenerClass, "a", characterEventClass);
-        hitResultGetTypeMethod = findMethod(hitResultClass, "d");
-        hitResultGetLocationMethod = findMethod(hitResultClass, "g");
-        blockHitResultGetBlockPosMethod = findMethod(blockHitResultClass, "b");
-        blockHitResultGetDirectionMethod = findMethod(blockHitResultClass, "c");
-        entityHitResultGetEntityMethod = findMethod(entityHitResultClass, "a");
-        blockPosAsLongMethod = findMethod(blockPosClass, "a");
-        blockPosGetXMethod = findMethod(blockPosClass, "a", long.class);
-        blockPosGetYMethod = findMethod(blockPosClass, "b", long.class);
-        blockPosGetZMethod = findMethod(blockPosClass, "c", long.class);
-        menuGetCarriedMethod = findMethod(abstractContainerMenuClass, "g");
-        slotGetItemMethod = findMethod(slotClass, "g");
-        slotHasItemMethod = findMethod(slotClass, "h");
-        slotIsActiveMethod = findMethod(slotClass, "b");
-        slotGetContainerSlotMethod = findMethod(slotClass, "i");
-        slotIsFakeMethod = findMethod(slotClass, "f");
-        itemStackIsEmptyMethod = findMethod(itemStackClass, "f");
-        itemStackGetHoverNameMethod = findMethod(itemStackClass, "y");
-        itemStackGetCountMethod = findMethod(itemStackClass, "N");
-        itemStackGetItemMethod = findMethod(itemStackClass, "h");
-        packetListenerGetListedOnlinePlayersMethod = findMethod(packetListenerClass, "n");
-        playerInfoGetProfileMethod = findMethod(playerInfoClass, "a");
-        playerInfoGetGameModeMethod = findMethod(playerInfoClass, "e");
-        playerInfoGetLatencyMethod = findMethod(playerInfoClass, "f");
-        playerInfoGetTabListDisplayNameMethod = findMethod(playerInfoClass, "i");
-        gameProfileGetIdMethod = findAccessibleMethod(gameProfileClass, "getId");
-        gameProfileGetNameMethod = findAccessibleMethod(gameProfileClass, "getName");
-        clientLevelAddEntityMethod = findMethod(clientLevelClass, "d", entityClass);
-        clientLevelRemoveEntityMethod = findMethod(clientLevelClass, "a", int.class, entityRemovalReasonClass);
-        clientLevelGetEntityMethod = findMethod(clientLevelClass, "a", int.class);
-        entityGetIdMethod = findMethod(entityClass, "aA");
-        entityGetUuidMethod = findMethod(entityClass, "cY");
-        entityGetNameMethod = findMethod(entityClass, "ap");
-        entitySetIdMethod = findMethod(entityClass, "e", int.class);
-        entitySetUuidMethod = findMethod(entityClass, "a", UUID.class);
-        entitySetPosMethod = findMethod(entityClass, "a_", double.class, double.class, double.class);
-        entitySetPosRawMethod = findOptionalMethod(entityClass, "n", double.class, double.class, double.class);
-        entitySetCustomNameMethod = findMethod(entityClass, "b", componentClass);
-        entitySetCustomNameVisibleMethod = findMethod(entityClass, "p", boolean.class);
-        entitySetNoGravityMethod = findMethod(entityClass, "g", boolean.class);
-        entitySetInvisibleMethod = findMethod(entityClass, "l", boolean.class);
-        screenshotGrabMethod = findMethod(screenshotClass, "a", File.class, String.class, renderTargetClass, int.class, Consumer.class);
+        getMinecraftInstanceMethod = findMethodAny(minecraftClass, new String[]{"getInstance", "V"});
+        keySetDownMethod = findMethodAny(keyMappingClass, new String[]{"setDown", "a"}, boolean.class);
+        keyMappingKeyField = findFieldAny(keyMappingClass, "key", "a");
+        keyClickMethod = findMethodAny(keyMappingClass, new String[]{"click", "a"}, keyMappingKeyField.getType());
+        sendChatMethod = findMethodAny(packetListenerClass, new String[]{"sendChat", "c"}, String.class);
+        sendCommandMethod = findMethodAny(packetListenerClass, new String[]{"sendCommand", "d"}, String.class);
+        entityGetXMethod = findMethodAny(entityClass, new String[]{"getX", "dP"});
+        entityGetYMethod = findMethodAny(entityClass, new String[]{"getY", "dR"});
+        entityGetZMethod = findMethodAny(entityClass, new String[]{"getZ", "dV"});
+        entityGetYawMethod = findMethodAny(entityClass, new String[]{"getYRot", "ec"});
+        entityGetPitchMethod = findMethodAny(entityClass, new String[]{"getXRot", "ee"});
+        entitySetYawMethod = findMethodAny(entityClass, new String[]{"setYRot", "v"}, float.class);
+        entitySetPitchMethod = findMethodAny(entityClass, new String[]{"setXRot", "w"}, float.class);
+        livingGetHealthMethod = findMethodAny(livingEntityClass, new String[]{"getHealth", "eZ"});
+        livingGetMaxHealthMethod = findMethodAny(livingEntityClass, new String[]{"getMaxHealth", "fq"});
+        playerGetFoodDataMethod = findMethodAny(playerClass, new String[]{"getFoodData", "gW"});
+        foodDataGetFoodLevelMethod = findMethodAny(foodDataClass, new String[]{"getFoodLevel", "a"});
+        foodDataGetSaturationMethod = findMethodAny(foodDataClass, new String[]{"getSaturationLevel", "d"});
+        inventorySetSelectedSlotMethod = findMethodAny(inventoryClass, new String[]{"setSelectedSlot", "d"}, int.class);
+        inventoryGetSelectedSlotMethod = findMethodAny(inventoryClass, new String[]{"getSelectedSlot", "g"});
+        gameModeSyncSelectedSlotMethod = findMethodAny(gameModeClass, new String[]{"ensureHasSentCarriedItem", "l"});
+        guiGetChatMethod = findMethodAny(guiClass, new String[]{"getChat", "e"});
+        componentGetStringMethod = findMethodAny(componentClass, new String[]{"getString"});
+        componentLiteralMethod = findMethodAny(componentClass, new String[]{"literal", "b"}, String.class);
+        screenGetTitleMethod = findMethodAny(screenClass, new String[]{"getTitle", "q"});
+        screenShouldCloseOnEscMethod = findMethodAny(screenClass, new String[]{"shouldCloseOnEsc", "aY_"});
+        screenOnCloseMethod = findMethodAny(screenClass, new String[]{"onClose", "aX_"});
+        screenInsertTextMethod = findMethodAny(screenClass, new String[]{"insertText", "a_"}, String.class, boolean.class);
+        widgetGetMessageMethod = findMethodAny(abstractWidgetClass, new String[]{"getMessage", "B"});
+        widgetIsActiveMethod = findMethodAny(abstractWidgetClass, new String[]{"isActive", "b"});
+        widgetGetXMethod = findMethodAny(abstractWidgetClass, new String[]{"getX", "aT_"});
+        widgetGetYMethod = findMethodAny(abstractWidgetClass, new String[]{"getY", "aU_"});
+        widgetGetWidthMethod = findMethodAny(abstractWidgetClass, new String[]{"getWidth", "aS_"});
+        widgetGetHeightMethod = findMethodAny(abstractWidgetClass, new String[]{"getHeight", "aR_"});
+        editBoxGetValueMethod = findMethodAny(editBoxClass, new String[]{"getValue", "a"});
+        guiMouseClickedMethod = findMethodAny(guiEventListenerClass, new String[]{"mouseClicked", "a"}, mouseButtonEventClass, boolean.class);
+        guiMouseReleasedMethod = findMethodAny(guiEventListenerClass, new String[]{"mouseReleased", "b"}, mouseButtonEventClass);
+        guiMouseScrolledMethod = findMethodAny(guiEventListenerClass, new String[]{"mouseScrolled", "a"}, double.class, double.class, double.class, double.class);
+        guiKeyPressedMethod = findMethodAny(guiEventListenerClass, new String[]{"keyPressed", "a"}, keyEventClass);
+        guiCharTypedMethod = findMethodAny(guiEventListenerClass, new String[]{"charTyped", "a"}, characterEventClass);
+        hitResultGetTypeMethod = findMethodAny(hitResultClass, new String[]{"getType", "d"});
+        hitResultGetLocationMethod = findMethodAny(hitResultClass, new String[]{"getLocation", "g"});
+        blockHitResultGetBlockPosMethod = findMethodAny(blockHitResultClass, new String[]{"getBlockPos", "b"});
+        blockHitResultGetDirectionMethod = findMethodAny(blockHitResultClass, new String[]{"getDirection", "c"});
+        entityHitResultGetEntityMethod = findMethodAny(entityHitResultClass, new String[]{"getEntity", "a"});
+        blockPosAsLongMethod = findMethodAny(blockPosClass, new String[]{"asLong", "a"});
+        blockPosGetXMethod = findMethodAny(blockPosClass, new String[]{"getX", "a"}, long.class);
+        blockPosGetYMethod = findMethodAny(blockPosClass, new String[]{"getY", "b"}, long.class);
+        blockPosGetZMethod = findMethodAny(blockPosClass, new String[]{"getZ", "c"}, long.class);
+        menuGetCarriedMethod = findMethodAny(abstractContainerMenuClass, new String[]{"getCarried", "g"});
+        slotGetItemMethod = findMethodAny(slotClass, new String[]{"getItem", "g"});
+        slotHasItemMethod = findMethodAny(slotClass, new String[]{"hasItem", "h"});
+        slotIsActiveMethod = findMethodAny(slotClass, new String[]{"isActive", "b"});
+        slotGetContainerSlotMethod = findMethodAny(slotClass, new String[]{"getContainerSlot", "i"});
+        slotIsFakeMethod = findMethodAny(slotClass, new String[]{"isFake", "f"});
+        itemStackIsEmptyMethod = findMethodAny(itemStackClass, new String[]{"isEmpty", "f"});
+        itemStackGetHoverNameMethod = findMethodAny(itemStackClass, new String[]{"getHoverName", "y"});
+        itemStackGetCountMethod = findMethodAny(itemStackClass, new String[]{"getCount", "N"});
+        itemStackGetItemMethod = findMethodAny(itemStackClass, new String[]{"getItem", "h"});
+        packetListenerGetListedOnlinePlayersMethod = findMethodAny(packetListenerClass, new String[]{"getListedOnlinePlayers", "n"});
+        playerInfoGetProfileMethod = findMethodAny(playerInfoClass, new String[]{"getProfile", "a"});
+        playerInfoGetGameModeMethod = findMethodAny(playerInfoClass, new String[]{"getGameMode", "e"});
+        playerInfoGetLatencyMethod = findMethodAny(playerInfoClass, new String[]{"getLatency", "f"});
+        playerInfoGetTabListDisplayNameMethod = findMethodAny(playerInfoClass, new String[]{"getTabListDisplayName", "i"});
+        gameProfileGetIdMethod = findMethodAny(gameProfileClass, new String[]{"getId", "id"});
+        gameProfileGetNameMethod = findMethodAny(gameProfileClass, new String[]{"getName", "name"});
+        clientLevelAddEntityMethod = findMethodAny(clientLevelClass, new String[]{"addEntity", "d"}, entityClass);
+        clientLevelRemoveEntityMethod = findMethodAny(clientLevelClass, new String[]{"removeEntity", "a"}, int.class, entityRemovalReasonClass);
+        clientLevelGetEntityMethod = findMethodAny(clientLevelClass, new String[]{"getEntity", "a"}, int.class);
+        entityGetIdMethod = findMethodAny(entityClass, new String[]{"getId", "aA"});
+        entityGetUuidMethod = findMethodAny(entityClass, new String[]{"getUUID", "cY"});
+        entityGetNameMethod = findMethodAny(entityClass, new String[]{"getName", "ap"});
+        entitySetIdMethod = findMethodAny(entityClass, new String[]{"setId", "e"}, int.class);
+        entitySetUuidMethod = findMethodAny(entityClass, new String[]{"setUUID", "a"}, UUID.class);
+        entitySetPosMethod = findMethodAny(entityClass, new String[]{"setPos", "a_"}, double.class, double.class, double.class);
+        entitySetPosRawMethod = findOptionalMethodAny(entityClass, new String[]{"setPosRaw", "n"}, double.class, double.class, double.class);
+        entitySetCustomNameMethod = findMethodAny(entityClass, new String[]{"setCustomName", "b"}, componentClass);
+        entitySetCustomNameVisibleMethod = findMethodAny(entityClass, new String[]{"setCustomNameVisible", "p"}, boolean.class);
+        entitySetNoGravityMethod = findMethodAny(entityClass, new String[]{"setNoGravity", "g"}, boolean.class);
+        entitySetInvisibleMethod = findMethodAny(entityClass, new String[]{"setInvisible", "l"}, boolean.class);
+        screenshotGrabMethod = findMethodAny(screenshotClass, new String[]{"grab", "a"}, File.class, String.class, renderTargetClass, int.class, Consumer.class);
 
-        localPlayerConnectionField = findField(localPlayerClass, "b");
-        playerInventoryField = findField(playerClass, "cE");
-        chatAllMessagesField = findField(chatComponentClass, "m");
-        chatRecentMessagesField = findField(chatComponentClass, "l");
-        screenChildrenField = findField(screenClass, "d");
-        screenRenderablesField = findField(screenClass, "t");
-        screenWidthField = findField(screenClass, "o");
-        screenHeightField = findField(screenClass, "p");
-        widgetVisibleField = findField(abstractWidgetClass, "l");
-        guiMessageContentField = findField(guiMessageClass, "b");
-        guiMessageTagField = findField(guiMessageClass, "d");
-        guiMessageAddedTimeField = findField(guiMessageClass, "a");
-        guiMessageTagLogTagField = findOptionalField("gfd", "d");
-        abstractContainerScreenMenuField = findField(abstractContainerScreenClass, "w");
-        abstractContainerScreenHoveredSlotField = findField(abstractContainerScreenClass, "y");
-        abstractContainerScreenLeftPosField = findField(abstractContainerScreenClass, "z");
-        abstractContainerScreenTopPosField = findField(abstractContainerScreenClass, "A");
-        abstractContainerMenuSlotsField = findField(abstractContainerMenuClass, "k");
-        slotXField = findField(slotClass, "e");
-        slotYField = findField(slotClass, "f");
-        vec3XField = findField(vec3Class, "g");
-        vec3YField = findField(vec3Class, "h");
-        vec3ZField = findField(vec3Class, "i");
+        localPlayerConnectionField = findFieldAny(localPlayerClass, "connection", "b");
+        playerInventoryField = findFieldAny(playerClass, "inventory", "cE");
+        chatAllMessagesField = findFieldAny(chatComponentClass, "allMessages", "m");
+        chatRecentMessagesField = findFieldAny(chatComponentClass, "recentChat", "l");
+        screenChildrenField = findFieldAny(screenClass, "children", "d");
+        screenRenderablesField = findFieldAny(screenClass, "renderables", "t");
+        screenWidthField = findFieldAny(screenClass, "width", "o");
+        screenHeightField = findFieldAny(screenClass, "height", "p");
+        widgetVisibleField = findFieldAny(abstractWidgetClass, "visible", "l");
+        guiMessageContentField = findFieldAny(guiMessageClass, "content", "b");
+        guiMessageTagField = findFieldAny(guiMessageClass, "tag", "d");
+        guiMessageAddedTimeField = findFieldAny(guiMessageClass, "addedTime", "a");
+        guiMessageTagLogTagField = findOptionalFieldAny(guiMessageTagClass, "logTag", "d");
+        abstractContainerScreenMenuField = findFieldAny(abstractContainerScreenClass, "menu", "w");
+        abstractContainerScreenHoveredSlotField = findFieldAny(abstractContainerScreenClass, "hoveredSlot", "y");
+        abstractContainerScreenLeftPosField = findFieldAny(abstractContainerScreenClass, "leftPos", "z");
+        abstractContainerScreenTopPosField = findFieldAny(abstractContainerScreenClass, "topPos", "A");
+        abstractContainerMenuSlotsField = findFieldAny(abstractContainerMenuClass, "slots", "k");
+        slotXField = findFieldAny(slotClass, "x", "e");
+        slotYField = findFieldAny(slotClass, "y", "f");
+        vec3XField = findFieldAny(vec3Class, "x", "g");
+        vec3YField = findFieldAny(vec3Class, "y", "h");
+        vec3ZField = findFieldAny(vec3Class, "z", "i");
 
         gameProfileConstructor = gameProfileClass.getDeclaredConstructor(UUID.class, String.class);
         gameProfileConstructor.setAccessible(true);
         remotePlayerConstructor = remotePlayerClass.getDeclaredConstructor(clientLevelClass, gameProfileClass);
         remotePlayerConstructor.setAccessible(true);
-        entityDiscardedRemovalReason = findField(entityRemovalReasonClass, "b").get(null);
+        entityDiscardedRemovalReason = findFieldAny(entityRemovalReasonClass, "DISCARDED", "b").get(null);
     }
 
     public Path getGameDirectory() throws ReflectiveOperationException {
@@ -803,13 +810,6 @@ public final class MinecraftBridge {
         onClientThread(() -> {
             Object screen = requireScreen();
             screenInsertTextMethod.invoke(screen, normalized, Boolean.FALSE);
-
-            for (int offset = 0; offset < normalized.length();) {
-                int codepoint = normalized.codePointAt(offset);
-                offset += Character.charCount(codepoint);
-                Object characterEvent = characterEventClass.getDeclaredConstructor(int.class, int.class).newInstance(codepoint, 0);
-                guiCharTypedMethod.invoke(screen, characterEvent);
-            }
             return null;
         });
     }
@@ -865,37 +865,29 @@ public final class MinecraftBridge {
     public void setLook(Float yaw, Float pitch, Float deltaYaw, Float deltaPitch) throws ReflectiveOperationException {
         onClientThread(() -> {
             Object player = requirePlayer();
-
-            float newYaw = yaw != null ? yaw : invokeFloat(entityGetYawMethod, player);
-            float newPitch = pitch != null ? pitch : invokeFloat(entityGetPitchMethod, player);
-
-            if (deltaYaw != null) {
-                newYaw += deltaYaw;
-            }
-            if (deltaPitch != null) {
-                newPitch += deltaPitch;
-            }
-
-            newPitch = Math.max(-90.0F, Math.min(90.0F, newPitch));
-            entitySetYawMethod.invoke(player, newYaw);
-            entitySetPitchMethod.invoke(player, newPitch);
+            applyLook(player, yaw, pitch, deltaYaw, deltaPitch);
             return null;
         });
     }
 
     public void setKey(String keyName, boolean state) throws ReflectiveOperationException {
-        String fieldName = optionKeyFieldName(keyName);
         onClientThread(() -> {
-            Object keyMapping = resolveKeyMapping(fieldName);
-            keySetDownMethod.invoke(keyMapping, state);
+            Object minecraft = getMinecraft();
+            Object options = minecraftOptionsField.get(minecraft);
+            applyKeyState(options, keyName, state);
             return null;
         });
     }
 
     public void releaseAllMovementKeys() throws ReflectiveOperationException {
-        for (String key : new String[] { "forward", "back", "left", "right", "jump", "sneak", "sprint", "use", "attack" }) {
-            setKey(key, false);
-        }
+        onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object options = minecraftOptionsField.get(minecraft);
+            for (String key : MOVEMENT_KEYS) {
+                applyKeyState(options, key, false);
+            }
+            return null;
+        });
     }
 
     public void setHotbarSlot(int slot) throws ReflectiveOperationException {
@@ -907,14 +899,73 @@ public final class MinecraftBridge {
         onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object player = requirePlayer();
-            Object inventory = playerInventoryField.get(player);
-            inventorySetSelectedSlotMethod.invoke(inventory, selectedSlot);
-
-            Object gameMode = minecraftGameModeField.get(minecraft);
-            if (gameMode != null) {
-                gameModeSyncSelectedSlotMethod.invoke(gameMode);
-            }
+            applyHotbarSlot(minecraft, player, selectedSlot);
             return null;
+        });
+    }
+
+    public Map<String, Object> applyControlState(
+        Map<String, Boolean> keyStates,
+        boolean clearMovement,
+        Float yaw,
+        Float pitch,
+        Float deltaYaw,
+        Float deltaPitch,
+        Integer hotbarSlot
+    ) throws ReflectiveOperationException {
+        if (hotbarSlot != null && (hotbarSlot < 1 || hotbarSlot > 9)) {
+            throw new IllegalArgumentException("slot must be between 1 and 9");
+        }
+
+        Map<String, Boolean> normalizedKeyStates = new LinkedHashMap<>();
+        if (keyStates != null) {
+            for (Map.Entry<String, Boolean> entry : keyStates.entrySet()) {
+                if (entry.getKey() == null || entry.getKey().isBlank() || entry.getValue() == null) {
+                    continue;
+                }
+                normalizedKeyStates.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object player = requirePlayer();
+            Object options = minecraftOptionsField.get(minecraft);
+
+            if (clearMovement) {
+                for (String key : MOVEMENT_KEYS) {
+                    applyKeyState(options, key, false);
+                }
+            }
+
+            for (Map.Entry<String, Boolean> entry : normalizedKeyStates.entrySet()) {
+                applyKeyState(options, entry.getKey(), entry.getValue());
+            }
+
+            Float appliedYaw = null;
+            Float appliedPitch = null;
+            if (yaw != null || pitch != null || deltaYaw != null || deltaPitch != null) {
+                float[] look = applyLook(player, yaw, pitch, deltaYaw, deltaPitch);
+                appliedYaw = look[0];
+                appliedPitch = look[1];
+            }
+
+            if (hotbarSlot != null) {
+                applyHotbarSlot(minecraft, player, hotbarSlot - 1);
+            }
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("ok", Boolean.TRUE);
+            payload.put("movementCleared", clearMovement);
+            payload.put("keysApplied", new ArrayList<>(normalizedKeyStates.keySet()));
+            if (hotbarSlot != null) {
+                payload.put("hotbarSlot", hotbarSlot);
+            }
+            if (appliedYaw != null && appliedPitch != null) {
+                payload.put("yaw", appliedYaw);
+                payload.put("pitch", appliedPitch);
+            }
+            return payload;
         });
     }
 
@@ -1182,11 +1233,50 @@ public final class MinecraftBridge {
         return mouseButtonEventClass.getDeclaredConstructor(double.class, double.class, mouseButtonInfoClass).newInstance(x, y, info);
     }
 
-    private Object resolveKeyMapping(String fieldName) throws ReflectiveOperationException {
+    private float[] applyLook(Object player, Float yaw, Float pitch, Float deltaYaw, Float deltaPitch) throws ReflectiveOperationException {
+        float newYaw = yaw != null ? yaw : invokeFloat(entityGetYawMethod, player);
+        float newPitch = pitch != null ? pitch : invokeFloat(entityGetPitchMethod, player);
+
+        if (deltaYaw != null) {
+            newYaw += deltaYaw;
+        }
+        if (deltaPitch != null) {
+            newPitch += deltaPitch;
+        }
+
+        newPitch = Math.max(-90.0F, Math.min(90.0F, newPitch));
+        entitySetYawMethod.invoke(player, newYaw);
+        entitySetPitchMethod.invoke(player, newPitch);
+        return new float[] { newYaw, newPitch };
+    }
+
+    private void applyKeyState(Object options, String keyName, boolean state) throws ReflectiveOperationException {
+        Object keyMapping = resolveKeyMapping(options, keyName);
+        keySetDownMethod.invoke(keyMapping, state);
+        if (state && shouldTriggerClick(keyName)) {
+            keyClickMethod.invoke(null, keyMappingKeyField.get(keyMapping));
+        }
+    }
+
+    private void applyHotbarSlot(Object minecraft, Object player, int selectedSlot) throws ReflectiveOperationException {
+        Object inventory = playerInventoryField.get(player);
+        inventorySetSelectedSlotMethod.invoke(inventory, selectedSlot);
+
+        Object gameMode = minecraftGameModeField.get(minecraft);
+        if (gameMode != null) {
+            gameModeSyncSelectedSlotMethod.invoke(gameMode);
+        }
+    }
+
+    private Object resolveKeyMapping(Object options, String keyName) throws ReflectiveOperationException {
+        Field field = findFieldAny(optionsClass, optionKeyFieldNames(keyName));
+        return field.get(options);
+    }
+
+    private Object resolveKeyMapping(String keyName) throws ReflectiveOperationException {
         Object minecraft = getMinecraft();
         Object options = minecraftOptionsField.get(minecraft);
-        Field field = findField(optionsClass, fieldName);
-        return field.get(options);
+        return resolveKeyMapping(options, keyName);
     }
 
     private Object getMinecraft() throws ReflectiveOperationException {
@@ -1258,52 +1348,94 @@ public final class MinecraftBridge {
         return base;
     }
 
-    private static String optionKeyFieldName(String keyName) {
+    private static String[] optionKeyFieldNames(String keyName) {
         Objects.requireNonNull(keyName, "keyName");
         return switch (keyName.toLowerCase(Locale.ROOT)) {
-            case "forward", "up", "w" -> "s";
-            case "left", "a" -> "t";
-            case "back", "down", "backward", "s_key" -> "u";
-            case "right", "d" -> "v";
-            case "jump", "space" -> "w";
-            case "sneak", "shift", "crouch" -> "x";
-            case "sprint", "run" -> "y";
-            case "inventory", "inv", "e" -> "z";
-            case "use", "interact", "right_click" -> "C";
-            case "attack", "left_click", "mine" -> "D";
-            case "pick", "pick_item", "middle_click" -> "E";
-            case "chat", "t" -> "F";
+            case "forward", "up", "w" -> new String[]{"keyUp", "s"};
+            case "left", "a" -> new String[]{"keyLeft", "t"};
+            case "back", "down", "backward", "s_key" -> new String[]{"keyDown", "u"};
+            case "right", "d" -> new String[]{"keyRight", "v"};
+            case "jump", "space" -> new String[]{"keyJump", "w"};
+            case "sneak", "shift", "crouch" -> new String[]{"keyShift", "x"};
+            case "sprint", "run" -> new String[]{"keySprint", "y"};
+            case "inventory", "inv", "e" -> new String[]{"keyInventory", "z"};
+            case "use", "interact", "right_click" -> new String[]{"keyUse", "C"};
+            case "attack", "left_click", "mine" -> new String[]{"keyAttack", "D"};
+            case "pick", "pick_item", "middle_click" -> new String[]{"keyPickItem", "E"};
+            case "chat", "t" -> new String[]{"keyChat", "F"};
             default -> throw new IllegalArgumentException("unsupported key: " + keyName);
         };
     }
 
-    private static Field findField(Class<?> owner, String name) throws ReflectiveOperationException {
-        Field field = owner.getDeclaredField(name);
-        field.setAccessible(true);
-        return field;
+    private static boolean shouldTriggerClick(String keyName) {
+        return switch (keyName.toLowerCase(Locale.ROOT)) {
+            case "inventory", "inv", "e", "chat", "t" -> true;
+            default -> false;
+        };
     }
 
-    private static Field findOptionalField(String ownerClassName, String name) {
+    private static Class<?> findClass(String... names) throws ClassNotFoundException {
+        ClassNotFoundException last = null;
+        for (String name : names) {
+            try {
+                return Class.forName(name);
+            } catch (ClassNotFoundException exception) {
+                last = exception;
+            }
+        }
+        throw last != null ? last : new ClassNotFoundException("no class names provided");
+    }
+
+    private static Field findFieldAny(Class<?> owner, String... names) throws ReflectiveOperationException {
+        ReflectiveOperationException last = null;
+        for (String name : names) {
+            for (Class<?> current = owner; current != null; current = current.getSuperclass()) {
+                try {
+                    Field field = current.getDeclaredField(name);
+                    field.setAccessible(true);
+                    return field;
+                } catch (NoSuchFieldException exception) {
+                    last = exception;
+                }
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(owner.getName());
+    }
+
+    private static Field findOptionalFieldAny(Class<?> owner, String... names) {
         try {
-            Field field = Class.forName(ownerClassName).getDeclaredField(name);
-            field.setAccessible(true);
-            return field;
+            return findFieldAny(owner, names);
         } catch (ReflectiveOperationException ignored) {
             return null;
         }
     }
 
-    private static Method findMethod(Class<?> owner, String name, Class<?>... parameterTypes) throws ReflectiveOperationException {
-        Method method = owner.getDeclaredMethod(name, parameterTypes);
-        method.setAccessible(true);
-        return method;
+    private static Method findMethodAny(Class<?> owner, String[] names, Class<?>... parameterTypes) throws ReflectiveOperationException {
+        ReflectiveOperationException last = null;
+        for (String name : names) {
+            for (Class<?> current = owner; current != null; current = current.getSuperclass()) {
+                try {
+                    Method method = current.getDeclaredMethod(name, parameterTypes);
+                    method.setAccessible(true);
+                    return method;
+                } catch (NoSuchMethodException exception) {
+                    last = exception;
+                }
+            }
+            try {
+                Method method = owner.getMethod(name, parameterTypes);
+                method.setAccessible(true);
+                return method;
+            } catch (NoSuchMethodException exception) {
+                last = exception;
+            }
+        }
+        throw last != null ? last : new NoSuchMethodException(owner.getName());
     }
 
-    private static Method findOptionalMethod(Class<?> owner, String name, Class<?>... parameterTypes) {
+    private static Method findOptionalMethodAny(Class<?> owner, String[] names, Class<?>... parameterTypes) {
         try {
-            Method method = owner.getDeclaredMethod(name, parameterTypes);
-            method.setAccessible(true);
-            return method;
+            return findMethodAny(owner, names, parameterTypes);
         } catch (ReflectiveOperationException ignored) {
             return null;
         }

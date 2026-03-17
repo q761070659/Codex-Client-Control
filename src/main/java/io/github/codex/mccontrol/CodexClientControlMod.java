@@ -9,6 +9,6 @@ public final class CodexClientControlMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        ControlBootstrap.start(LOGGER);
+        ControlBootstrap.startAsync(LOGGER);
     }
 }

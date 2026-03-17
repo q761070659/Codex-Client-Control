@@ -75,14 +75,19 @@ public final class ControlHttpServer {
         try (socket;
              BufferedInputStream inputStream = new BufferedInputStream(socket.getInputStream());
              BufferedOutputStream outputStream = new BufferedOutputStream(socket.getOutputStream())) {
+            while (true) {
+                HttpRequest request = readRequest(inputStream);
+                if (request == null) {
+                    return;
+                }
 
-            HttpRequest request = readRequest(inputStream);
-            if (request == null) {
-                return;
+                boolean keepAlive = shouldKeepAlive(request);
+                HttpResponse response = withConnectionHeader(route(request), keepAlive);
+                writeResponse(outputStream, response);
+                if (!keepAlive) {
+                    return;
+                }
             }
-
-            HttpResponse response = route(request);
-            writeResponse(outputStream, response);
         } catch (Throwable throwable) {
             logger.log(Level.WARNING, "Control socket failed", throwable);
         }
@@ -145,6 +150,17 @@ public final class ControlHttpServer {
             if ("POST".equalsIgnoreCase(request.method()) && "/key".equals(request.path())) {
                 bridge.setKey(stringValue(body, "key"), booleanValue(body, "state", false));
                 return jsonResponse(200, okPayload("updated"));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/input".equals(request.path())) {
+                return jsonResponse(200, bridge.applyControlState(
+                    optionalBooleanMapValue(body, "keys"),
+                    booleanValue(body, "clearMovement", false),
+                    floatValue(body, "yaw"),
+                    floatValue(body, "pitch"),
+                    floatValue(body, "deltaYaw"),
+                    floatValue(body, "deltaPitch"),
+                    intObjectValue(body, "hotbar")
+                ));
             }
             if ("POST".equalsIgnoreCase(request.method()) && "/tap".equals(request.path())) {
                 String key = stringValue(body, "key");
@@ -292,6 +308,7 @@ public final class ControlHttpServer {
             case "wait" -> waitStep(index, step);
             case "look" -> lookStep(index, step);
             case "key" -> keyStep(index, step);
+            case "input" -> inputStep(index, step);
             case "tap" -> tapStep(index, step);
             case "hotbar" -> hotbarStep(index, step);
             case "chat" -> chatStep(index, step);
@@ -328,6 +345,20 @@ public final class ControlHttpServer {
         return stepPayload(index, "key");
     }
 
+    private Map<String, Object> inputStep(int index, JsonObject step) throws Exception {
+        Map<String, Object> payload = stepPayload(index, "input");
+        payload.putAll(bridge.applyControlState(
+            optionalBooleanMapValue(step, "keys"),
+            booleanValue(step, "clearMovement", false),
+            floatValue(step, "yaw"),
+            floatValue(step, "pitch"),
+            floatValue(step, "deltaYaw"),
+            floatValue(step, "deltaPitch"),
+            intObjectValue(step, "hotbar")
+        ));
+        return payload;
+    }
+
     private Map<String, Object> tapStep(int index, JsonObject step) throws Exception {
         String key = stringValue(step, "key");
         int durationMs = intValue(step, "durationMs", 120);
@@ -362,20 +393,29 @@ public final class ControlHttpServer {
     }
 
     private Map<String, Object> moveStep(int index, JsonObject step) throws Exception {
-        if (step.has("yaw") || step.has("pitch") || step.has("deltaYaw") || step.has("deltaPitch")) {
-            bridge.setLook(floatValue(step, "yaw"), floatValue(step, "pitch"), floatValue(step, "deltaYaw"), floatValue(step, "deltaPitch"));
-        }
-
+        Map<String, Boolean> keyStates = new LinkedHashMap<>();
         List<String> pressedKeys = new ArrayList<>();
         for (String key : MOVEMENT_SEQUENCE_KEYS) {
             if (!step.has(key)) {
                 continue;
             }
             boolean state = step.get(key).getAsBoolean();
-            bridge.setKey(key, state);
+            keyStates.put(key, state);
             if (state) {
                 pressedKeys.add(key);
             }
+        }
+
+        if (!keyStates.isEmpty() || step.has("yaw") || step.has("pitch") || step.has("deltaYaw") || step.has("deltaPitch")) {
+            bridge.applyControlState(
+                keyStates,
+                false,
+                floatValue(step, "yaw"),
+                floatValue(step, "pitch"),
+                floatValue(step, "deltaYaw"),
+                floatValue(step, "deltaPitch"),
+                null
+            );
         }
 
         int durationMs = intValue(step, "durationMs", 0);
@@ -384,8 +424,12 @@ public final class ControlHttpServer {
             Thread.sleep(durationMs);
         }
 
-        for (String key : pressedKeys) {
-            bridge.setKey(key, false);
+        if (!pressedKeys.isEmpty()) {
+            Map<String, Boolean> releasedKeys = new LinkedHashMap<>();
+            for (String key : pressedKeys) {
+                releasedKeys.put(key, Boolean.FALSE);
+            }
+            bridge.applyControlState(releasedKeys, false, null, null, null, null, null);
         }
 
         Map<String, Object> payload = stepPayload(index, "move");
@@ -499,9 +543,35 @@ public final class ControlHttpServer {
         return body.get(key).getAsBoolean();
     }
 
+    private static Map<String, Boolean> optionalBooleanMapValue(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
+            return Map.of();
+        }
+        if (!body.get(key).isJsonObject()) {
+            throw new IllegalArgumentException("field must be an object: " + key);
+        }
+
+        Map<String, Boolean> values = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonElement> entry : body.getAsJsonObject(key).entrySet()) {
+            JsonElement value = entry.getValue();
+            if (value == null || value.isJsonNull()) {
+                continue;
+            }
+            values.put(entry.getKey(), value.getAsBoolean());
+        }
+        return values;
+    }
+
     private static int intValue(JsonObject body, String key, int fallback) {
         if (!body.has(key)) {
             return fallback;
+        }
+        return body.get(key).getAsInt();
+    }
+
+    private static Integer intObjectValue(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) {
+            return null;
         }
         return body.get(key).getAsInt();
     }
@@ -604,6 +674,7 @@ public final class ControlHttpServer {
             "POST /command",
             "POST /look",
             "POST /key",
+            "POST /input",
             "POST /tap",
             "POST /hotbar",
             "POST /release-all",
@@ -642,8 +713,18 @@ public final class ControlHttpServer {
         byte[] bytes = GSON.toJson(payload).getBytes(StandardCharsets.UTF_8);
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Content-Type", "application/json; charset=utf-8");
-        headers.put("Connection", "close");
         return new HttpResponse(statusCode, headers, bytes);
+    }
+
+    private static HttpResponse withConnectionHeader(HttpResponse response, boolean keepAlive) {
+        Map<String, String> headers = new LinkedHashMap<>(response.headers());
+        headers.put("Connection", keepAlive ? "keep-alive" : "close");
+        return new HttpResponse(response.statusCode(), headers, response.body());
+    }
+
+    private static boolean shouldKeepAlive(HttpRequest request) {
+        String connection = request.headers().get("connection");
+        return connection == null || !"close".equalsIgnoreCase(connection);
     }
 
     private static HttpRequest readRequest(BufferedInputStream inputStream) throws IOException {
