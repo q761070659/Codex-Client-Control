@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "codex_client_control",
+  "version": "1.0.0+1.21.11",
+  "name": "Codex Client Control",
+  "description": "Local-only HTTP control bridge for Minecraft 1.21.11 Fabric clients.",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "io.github.codex.mccontrol.CodexClientControlMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.11",
+    "java": ">=21"
+  }
+}
