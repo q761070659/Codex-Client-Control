@@ -1,8 +1,13 @@
 # Codex Client Control
 
-这是一个给 `1.21.11far` 实例准备的 Fabric 客户端控制模组。
+这是一个给 `1.21.11far` 和 `1.21.11-NeoForge_21.11.38-beta` 准备的客户端控制模组。
 
 它启动后会在本机开启一个只监听 `127.0.0.1` 的 HTTP 接口，方便通过脚本控制当前客户端。
+
+当前会同时构建两个版本：
+
+- Fabric: `build/codex-client-control-fabric-1.0.0+1.21.11.jar`
+- NeoForge: `build/codex-client-control-neoforge-1.0.0+1.21.11.jar`
 
 ## 已实现接口
 
