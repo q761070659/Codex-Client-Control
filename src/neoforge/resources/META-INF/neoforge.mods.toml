@@ -1,0 +1,11 @@
+modLoader="javafml"
+loaderVersion="[3,]"
+license="MIT"
+
+[[mods]]
+modId="codex_client_control"
+version="1.0.0+1.21.11"
+displayName="Codex Client Control"
+description='''
+Local-only HTTP control bridge for Minecraft 1.21.11 NeoForge clients.
+'''
