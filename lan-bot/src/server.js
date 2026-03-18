@@ -561,31 +561,124 @@ async function ensureNear(bot, x, y, z, range) {
   await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range));
 }
 
+function registryItemName(itemName) {
+  return String(itemName || "").toLowerCase().replace(/^minecraft:/, "");
+}
+
+function getItemStackSize(bot, itemName) {
+  const normalized = registryItemName(itemName);
+  const registryItem = bot.registry &&
+    bot.registry.itemsByName &&
+    bot.registry.itemsByName[normalized];
+  if (registryItem && typeof registryItem.stackSize === "number" && registryItem.stackSize > 0) {
+    return registryItem.stackSize;
+  }
+
+  const inventoryItem = bot.inventory.items().find((entry) => entry.name === normalized);
+  if (inventoryItem && typeof inventoryItem.stackSize === "number" && inventoryItem.stackSize > 0) {
+    return inventoryItem.stackSize;
+  }
+
+  return 64;
+}
+
+async function dropInventoryItemCount(bot, itemName, count) {
+  let remaining = Math.max(0, Math.floor(count || 0));
+  while (remaining > 0) {
+    const item = bot.inventory.items().find((entry) => entry.name === registryItemName(itemName));
+    if (!item) {
+      break;
+    }
+    const amount = Math.min(remaining, item.count);
+    await bot.toss(item.type, item.metadata ?? null, amount);
+    remaining -= amount;
+    await sleep(150);
+  }
+}
+
+async function trimInventoryItem(bot, itemName, maximumCount) {
+  const limit = Math.max(0, Math.floor(maximumCount || 0));
+  let current = countInventoryItem(bot, itemName);
+  if (current <= limit) {
+    return current;
+  }
+
+  const removeCount = current - limit;
+  await runBotCommand(bot, "/clear " + bot.username + " " + itemName + " " + String(removeCount));
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await sleep(200);
+    current = countInventoryItem(bot, itemName);
+    if (current <= limit) {
+      return current;
+    }
+  }
+
+  await dropInventoryItemCount(bot, itemName, current - limit);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await sleep(200);
+    current = countInventoryItem(bot, itemName);
+    if (current <= limit) {
+      return current;
+    }
+  }
+
+  throw new Error("failed to trim item: " + itemName);
+}
+
 async function ensureInventoryItem(bot, itemName, minimumCount) {
   const requiredCount = Math.max(1, Math.floor(minimumCount || 1));
-  const current = bot.inventory.items()
-    .filter((item) => item.name === itemName)
-    .reduce((sum, item) => sum + item.count, 0);
+  const stackSize = getItemStackSize(bot, itemName);
+  let current = countInventoryItem(bot, itemName);
 
   if (current >= requiredCount) {
     return current;
   }
 
-  bot.chat("/give " + bot.username + " " + itemName + " " + String(Math.max(requiredCount, 64)));
-  await sleep(400);
+  let stalledBatches = 0;
+  while (current < requiredCount && stalledBatches < 3) {
+    const missing = requiredCount - current;
+    const giveCount = Math.max(1, Math.min(missing, stackSize));
+    const previous = current;
+    await runBotCommand(bot, "/give " + bot.username + " " + itemName + " " + String(giveCount));
 
-  const updated = bot.inventory.items()
-    .filter((item) => item.name === itemName)
-    .reduce((sum, item) => sum + item.count, 0);
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await sleep(250);
+      current = countInventoryItem(bot, itemName);
+      if (current >= requiredCount || current >= previous + giveCount) {
+        break;
+      }
+    }
 
-  if (updated < requiredCount) {
-    throw new Error("failed to obtain item: " + itemName);
+    if (current > previous) {
+      stalledBatches = 0;
+    } else {
+      stalledBatches += 1;
+    }
   }
 
-  return updated;
+  if (current >= requiredCount) {
+    return current;
+  }
+
+  throw new Error("failed to obtain item: " + itemName);
 }
 
-function getPlacementSupport(bot, x, y, z) {
+function getPlacementSupport(bot, x, y, z, preferredSupport) {
+  if (preferredSupport &&
+    preferredSupport.position &&
+    preferredSupport.face &&
+    preferredSupport.position.x + preferredSupport.face.x === x &&
+    preferredSupport.position.y + preferredSupport.face.y === y &&
+    preferredSupport.position.z + preferredSupport.face.z === z) {
+    const preferredBlock = bot.blockAt(preferredSupport.position);
+    if (!isAir(preferredBlock)) {
+      return {
+        block: preferredBlock,
+        face: preferredSupport.face
+      };
+    }
+  }
+
   const candidates = [
     { support: new Vec3(x, y - 1, z), face: new Vec3(0, 1, 0) },
     { support: new Vec3(x - 1, y, z), face: new Vec3(1, 0, 0) },
@@ -616,6 +709,7 @@ async function placeBlockByHand(bot, placement, options) {
   const range = options.range;
   const placeDelayMs = options.placeDelayMs;
   const replace = options.replace;
+  const preferredSupport = options.preferredSupport || null;
 
   await ensureInventoryItem(bot, item, 1);
 
@@ -642,7 +736,7 @@ async function placeBlockByHand(bot, placement, options) {
     await sleep(150);
   }
 
-  const support = getPlacementSupport(bot, x, y, z);
+  const support = getPlacementSupport(bot, x, y, z, preferredSupport);
   if (!support) {
     throw new Error("no support block near " + blockKey(x, y, z));
   }
@@ -674,6 +768,25 @@ async function placeBlockByHand(bot, placement, options) {
     placed: true,
     skipped: false,
     finalBlock: placed.name
+  };
+}
+
+async function clearBlockIfNeeded(bot, x, y, z, range, delayMs) {
+  const position = new Vec3(x, y, z);
+  const block = bot.blockAt(position);
+  if (isAir(block)) {
+    return {
+      cleared: false,
+      finalBlock: "air"
+    };
+  }
+
+  await ensureNear(bot, x, y, z, range);
+  await bot.dig(block, true);
+  await sleep(delayMs);
+  return {
+    cleared: true,
+    finalBlock: "air"
   };
 }
 
@@ -759,6 +872,247 @@ function buildSmallHousePlacements(originX, originY, originZ, wallItem, roofItem
 
   result.push({ x: originX + 2, y: originY + 1, z: originZ + 2, item: lightItem });
   return sortPlacements(result);
+}
+
+function countInventoryItem(bot, itemName) {
+  const normalized = registryItemName(itemName);
+  return bot.inventory.items()
+    .filter((item) => item.name === normalized)
+    .reduce((sum, item) => sum + item.count, 0);
+}
+
+function getBlockAge(block) {
+  if (!block) {
+    return null;
+  }
+  if (typeof block.getProperties === "function") {
+    const properties = block.getProperties();
+    if (properties && "age" in properties) {
+      if (typeof properties.age === "number" && Number.isFinite(properties.age)) {
+        return properties.age;
+      }
+      const parsedAge = Number(properties.age);
+      if (Number.isFinite(parsedAge)) {
+        return parsedAge;
+      }
+    }
+  }
+  return null;
+}
+
+function isMatureCrop(block, cropName) {
+  if (!block || block.name !== cropName) {
+    return false;
+  }
+  const age = getBlockAge(block);
+  if (age === null) {
+    return true;
+  }
+  return age >= 7;
+}
+
+async function runBotCommand(bot, command) {
+  chatHistory.addTyped(command);
+  bot.chat(command);
+  await sleep(400);
+}
+
+async function rightClickBlockWithItem(bot, itemName, x, y, z, range, delayMs, options) {
+  const face = options && options.face ? options.face : new Vec3(0, 1, 0);
+  const cursorPos = options && options.cursorPos ? options.cursorPos : new Vec3(0.5, 0.5, 0.5);
+  await ensureNear(bot, x, y, z, range);
+  await equipItemByName(bot, itemName);
+  const block = bot.blockAt(new Vec3(x, y, z));
+  if (!block) {
+    throw new Error("target block not found at " + blockKey(x, y, z));
+  }
+  await bot.lookAt(new Vec3(x + 0.5, y + 0.5, z + 0.5), true);
+  await bot.activateBlock(block, face, cursorPos);
+  await sleep(delayMs);
+  return block;
+}
+
+async function ensureSupportBlockByHand(bot, x, y, z, itemName, range, delayMs) {
+  const supportBlock = bot.blockAt(new Vec3(x, y, z));
+  if (!isAir(supportBlock)) {
+    return {
+      x,
+      y,
+      z,
+      item: itemName,
+      placed: false,
+      skipped: true,
+      finalBlock: supportBlock.name
+    };
+  }
+
+  return placeBlockByHand(bot, { x, y, z, item: itemName }, {
+    range,
+    placeDelayMs: delayMs,
+    replace: false
+  });
+}
+
+async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
+  const targetPos = new Vec3(x, y, z);
+  const existing = bot.blockAt(targetPos);
+  if (existing && existing.name === "water") {
+    return {
+      x,
+      y,
+      z,
+      placed: false,
+      skipped: true,
+      finalBlock: existing.name
+    };
+  }
+
+  if (!isAir(existing)) {
+    throw new Error("water target occupied at " + blockKey(x, y, z) + " by " + existing.name);
+  }
+
+  const supportBlock = bot.blockAt(new Vec3(x, y - 1, z));
+  if (!supportBlock || isAir(supportBlock)) {
+    throw new Error("water support missing at " + blockKey(x, y - 1, z));
+  }
+
+  await ensureInventoryItem(bot, itemName, 1);
+  await ensureNear(bot, x, y, z, range);
+  await equipItemByName(bot, itemName);
+  await bot.activateBlock(supportBlock, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5));
+
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await sleep(delayMs);
+    const placed = bot.blockAt(targetPos);
+    if (placed && placed.name === "water") {
+      return {
+        x,
+        y,
+        z,
+        placed: true,
+        skipped: false,
+        finalBlock: placed.name
+      };
+    }
+  }
+
+  throw new Error("failed to place water at " + blockKey(x, y, z));
+}
+
+async function isDoubleChestContainer(bot, x, y, z, range) {
+  await ensureNear(bot, x, y, z, range);
+  const chestBlock = bot.blockAt(new Vec3(x, y, z));
+  if (!chestBlock || chestBlock.name !== "chest") {
+    return false;
+  }
+
+  const container = await bot.openContainer(chestBlock);
+  try {
+    return container.inventoryStart >= 54;
+  } finally {
+    container.close();
+    await sleep(150);
+  }
+}
+
+async function placeDoubleChestByHand(bot, firstPlacement, secondPlacement, options) {
+  const range = options.range;
+  const placeDelayMs = options.placeDelayMs;
+  const firstPos = new Vec3(firstPlacement.x, firstPlacement.y, firstPlacement.z);
+  const secondPos = new Vec3(secondPlacement.x, secondPlacement.y, secondPlacement.z);
+  const preferredSupport = {
+    position: firstPos,
+    face: new Vec3(
+      secondPlacement.x - firstPlacement.x,
+      secondPlacement.y - firstPlacement.y,
+      secondPlacement.z - firstPlacement.z
+    )
+  };
+
+  await placeBlockByHand(bot, firstPlacement, {
+    range,
+    placeDelayMs,
+    replace: false
+  });
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const secondBlock = bot.blockAt(secondPos);
+    if (!secondBlock || secondBlock.name !== secondPlacement.item) {
+      await placeBlockByHand(bot, secondPlacement, {
+        range,
+        placeDelayMs,
+        replace: false,
+        preferredSupport
+      });
+    }
+
+    if (await isDoubleChestContainer(bot, firstPlacement.x, firstPlacement.y, firstPlacement.z, range)) {
+      return {
+        placed: true,
+        merged: true
+      };
+    }
+
+    const retryBlock = bot.blockAt(secondPos);
+    if (retryBlock && retryBlock.name === secondPlacement.item) {
+      await ensureNear(bot, secondPlacement.x, secondPlacement.y, secondPlacement.z, range);
+      await bot.dig(retryBlock, true);
+      await sleep(placeDelayMs);
+    }
+  }
+
+  throw new Error("failed to merge double chest at " + blockKey(firstPlacement.x, firstPlacement.y, firstPlacement.z));
+}
+
+function findWindowItemSlot(window, itemName, start, end) {
+  for (let slot = start; slot < end; slot += 1) {
+    const item = window.slots[slot];
+    if (item && item.name === itemName) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+function firstEmptyContainerSlot(window, startSlot) {
+  for (let slot = startSlot; slot < window.inventoryStart; slot += 1) {
+    if (!window.slots[slot]) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+function buildFivePatternSlots() {
+  return [
+    0, 1, 2,
+    9,
+    18, 19, 20,
+    29,
+    36, 37, 38
+  ];
+}
+
+async function arrangeItemsInChest(window, bot, itemName, patternSlots, remainderSlot) {
+  const requiredSlots = Math.max(...patternSlots) + 1;
+  if (window.inventoryStart < requiredSlots) {
+    throw new Error("container too small for pattern, storage slots=" + String(window.inventoryStart));
+  }
+
+  const sourceSlot = findWindowItemSlot(window, itemName, window.inventoryStart, window.inventoryEnd);
+  if (sourceSlot < 0) {
+    throw new Error("item not found in inventory window: " + itemName);
+  }
+
+  await bot.clickWindow(sourceSlot, 0, 0);
+  for (const slot of patternSlots) {
+    await bot.clickWindow(slot, 1, 0);
+  }
+
+  if (window.selectedItem) {
+    const targetSlot = remainderSlot >= 0 ? remainderSlot : sourceSlot;
+    await bot.clickWindow(targetSlot, 0, 0);
+  }
 }
 
 async function moveTo(body) {
@@ -1083,9 +1437,187 @@ async function buildSmallHouse(body) {
   });
 }
 
+async function farmStoreFive(body) {
+  return actionManager.run("farm_store_five", async (manager) => {
+    const bot = requireBot();
+    const originX = Math.floor(numberValue(body, "x"));
+    const supportY = Math.floor(numberValue(body, "y"));
+    const originZ = Math.floor(numberValue(body, "z"));
+    const range = numberValue(body, "range", 4);
+    const useDelayMs = numberValue(body, "useDelayMs", 150);
+    const cropItem = stringValue(body, "cropItem", "wheat");
+    const seedItem = stringValue(body, "seedItem", "wheat_seeds");
+    const chestItem = stringValue(body, "chestItem", "chest");
+    const hoeItem = stringValue(body, "hoeItem", "diamond_hoe");
+    const boneMealItem = stringValue(body, "boneMealItem", "bone_meal");
+    const waterItem = stringValue(body, "waterItem", "water_bucket");
+    const width = 5;
+    const depth = 5;
+    const cropY = supportY + 1;
+    const centerX = originX + 2;
+    const centerZ = originZ + 2;
+    const cropPositions = [];
+    const results = {
+      tilled: 0,
+      planted: 0,
+      matured: 0,
+      harvested: 0,
+      wheatCount: 0,
+      chestPlaced: false,
+      patternPlaced: false
+    };
+
+    await runBotCommand(bot, "/gamemode survival " + bot.username);
+    await trimInventoryItem(bot, hoeItem, 1);
+    await trimInventoryItem(bot, waterItem, 1);
+    await ensureInventoryItem(bot, hoeItem, 1);
+    await ensureInventoryItem(bot, seedItem, 64);
+    await ensureInventoryItem(bot, boneMealItem, 64);
+    await ensureInventoryItem(bot, chestItem, 2);
+    await ensureInventoryItem(bot, waterItem, 1);
+
+    for (let dz = 0; dz < depth; dz += 1) {
+      for (let dx = 0; dx < width; dx += 1) {
+        const x = originX + dx;
+        const z = originZ + dz;
+        if (x === centerX && z === centerZ) {
+          continue;
+        }
+        cropPositions.push({ x, z });
+      }
+    }
+
+    const centerSupport = bot.blockAt(new Vec3(centerX, supportY, centerZ));
+    if (!centerSupport || isAir(centerSupport)) {
+      throw new Error("farm center support missing at " + blockKey(centerX, supportY, centerZ));
+    }
+
+    await rightClickBlockWithItem(bot, waterItem, centerX, supportY, centerZ, range, useDelayMs);
+
+    for (const position of cropPositions) {
+      if (manager.isCancelled()) {
+        throw new Error("action cancelled");
+      }
+
+      const groundBlock = bot.blockAt(new Vec3(position.x, supportY, position.z));
+      if (!groundBlock || isAir(groundBlock)) {
+        throw new Error("farm support missing at " + blockKey(position.x, supportY, position.z));
+      }
+
+      let farmland = bot.blockAt(new Vec3(position.x, supportY, position.z));
+      if (!farmland || farmland.name !== "farmland") {
+        await rightClickBlockWithItem(bot, hoeItem, position.x, supportY, position.z, range, useDelayMs);
+        farmland = bot.blockAt(new Vec3(position.x, supportY, position.z));
+      }
+      if (!farmland || farmland.name !== "farmland") {
+        throw new Error("failed to till farmland at " + blockKey(position.x, supportY, position.z));
+      }
+      results.tilled += 1;
+
+      let cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+      if (isAir(cropBlock)) {
+        await rightClickBlockWithItem(bot, seedItem, position.x, supportY, position.z, range, useDelayMs);
+        cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+      }
+      if (!cropBlock || cropBlock.name !== cropItem) {
+        throw new Error("failed to plant crop at " + blockKey(position.x, cropY, position.z));
+      }
+      results.planted += 1;
+
+      let attempts = 0;
+      while (!isMatureCrop(cropBlock, cropItem) && attempts < 12) {
+        await rightClickBlockWithItem(bot, boneMealItem, position.x, cropY, position.z, range, useDelayMs);
+        cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+        attempts += 1;
+      }
+      if (!isMatureCrop(cropBlock, cropItem)) {
+        throw new Error("failed to mature crop at " + blockKey(position.x, cropY, position.z));
+      }
+      results.matured += 1;
+    }
+
+    for (const position of cropPositions) {
+      if (manager.isCancelled()) {
+        throw new Error("action cancelled");
+      }
+
+      const cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+      if (cropBlock && cropBlock.name === cropItem) {
+        await ensureNear(bot, position.x, cropY, position.z, range);
+        await bot.dig(cropBlock, true);
+        await sleep(useDelayMs);
+        results.harvested += 1;
+      }
+    }
+
+    const collectPoints = [
+      { x: originX + 2, y: cropY, z: originZ + 2 },
+      { x: originX, y: cropY, z: originZ },
+      { x: originX + 4, y: cropY, z: originZ + 4 },
+      { x: originX, y: cropY, z: originZ + 4 },
+      { x: originX + 4, y: cropY, z: originZ }
+    ];
+    for (const point of collectPoints) {
+      await ensureNear(bot, point.x, point.y, point.z, 1);
+      await sleep(150);
+    }
+
+    await sleep(1000);
+    results.wheatCount = countInventoryItem(bot, cropItem);
+    if (results.wheatCount < buildFivePatternSlots().length) {
+      throw new Error("not enough harvested wheat to form 5, count=" + String(results.wheatCount));
+    }
+
+    const chestAX = originX + width + 2;
+    const chestAZ = originZ + 2;
+    const chestAY = cropY;
+    await placeBlockByHand(bot, { x: chestAX, y: chestAY, z: chestAZ, item: chestItem }, {
+      range,
+      placeDelayMs: useDelayMs,
+      replace: false
+    });
+    await placeBlockByHand(bot, { x: chestAX + 1, y: chestAY, z: chestAZ, item: chestItem }, {
+      range,
+      placeDelayMs: useDelayMs,
+      replace: false
+    });
+    results.chestPlaced = true;
+
+    await ensureNear(bot, chestAX, chestAY, chestAZ, range);
+    const chestBlock = bot.blockAt(new Vec3(chestAX, chestAY, chestAZ));
+    if (!chestBlock) {
+      throw new Error("chest block not found");
+    }
+
+    const container = await bot.openContainer(chestBlock);
+    try {
+      const patternSlots = buildFivePatternSlots();
+      const remainderSlot = firstEmptyContainerSlot(container, Math.max(...patternSlots) + 1);
+      await arrangeItemsInChest(container, bot, cropItem, patternSlots, remainderSlot);
+      results.patternPlaced = true;
+    } finally {
+      container.close();
+    }
+
+    return {
+      ok: true,
+      action: "farm_store_five",
+      origin: {
+        x: originX,
+        y: supportY,
+        z: originZ
+      },
+      results
+    };
+  });
+}
+
 async function runAction(body) {
   const action = stringValue(body, "action");
   switch (action) {
+    case "farm_store_five":
+    case "farm-store-five":
+      return farmStoreFive(body);
     case "place_blocks":
     case "place-blocks":
       return placeBlocks(body);
