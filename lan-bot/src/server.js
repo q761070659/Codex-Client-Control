@@ -822,12 +822,42 @@ function botIntersectsBlock(bot, x, y, z) {
     minZ < z + 1;
 }
 
-async function moveOutOfTargetBlock(bot, x, y, z) {
-  if (!botIntersectsBlock(bot, x, y, z)) {
+function botTouchesPlacement(bot, x, y, z) {
+  if (!bot || !bot.entity || !bot.entity.position) {
+    return false;
+  }
+
+  if (botIntersectsBlock(bot, x, y, z)) {
+    return true;
+  }
+
+  const halfWidth = 0.3;
+  const position = bot.entity.position;
+  const minX = Math.floor(position.x - halfWidth);
+  const maxX = Math.floor(position.x + halfWidth);
+  const minZ = Math.floor(position.z - halfWidth);
+  const maxZ = Math.floor(position.z + halfWidth);
+  const standingY = Math.floor(position.y - 0.01);
+
+  return y === standingY &&
+    x >= minX &&
+    x <= maxX &&
+    z >= minZ &&
+    z <= maxZ;
+}
+
+async function moveOutOfTargetBlock(bot, x, y, z, support) {
+  const supportPosition = support && support.block ? support.block.position : null;
+  if (!botTouchesPlacement(bot, x, y, z) &&
+    !(supportPosition && botTouchesPlacement(bot, supportPosition.x, supportPosition.y, supportPosition.z))) {
     return;
   }
 
   const offsets = [
+    { dx: 3, dz: 0 },
+    { dx: -3, dz: 0 },
+    { dx: 0, dz: 3 },
+    { dx: 0, dz: -3 },
     { dx: 2, dz: 0 },
     { dx: -2, dz: 0 },
     { dx: 0, dz: 2 },
@@ -845,7 +875,8 @@ async function moveOutOfTargetBlock(bot, x, y, z) {
       continue;
     }
 
-    if (!botIntersectsBlock(bot, x, y, z)) {
+    if (!botTouchesPlacement(bot, x, y, z) &&
+      !(supportPosition && botTouchesPlacement(bot, supportPosition.x, supportPosition.y, supportPosition.z))) {
       return;
     }
   }
@@ -928,12 +959,11 @@ async function placeBlockByHand(bot, placement, options) {
   }
 
   await ensureNear(bot, x, y, z, range);
-  await moveOutOfTargetBlock(bot, x, y, z);
 
   let lastError = null;
   for (const support of supports) {
     await ensureNear(bot, x, y, z, range);
-    await moveOutOfTargetBlock(bot, x, y, z);
+    await moveOutOfTargetBlock(bot, x, y, z, support);
     await equipItemByName(bot, item);
 
     try {
@@ -1015,6 +1045,76 @@ function sortPlacements(placements) {
     }
     return left.x - right.x;
   });
+}
+
+function addWalkableStairRun(config) {
+  const {
+    setPlacementData,
+    clearPlacement,
+    startX,
+    startY,
+    startZ,
+    dirX,
+    dirZ,
+    width,
+    rise,
+    supportItem,
+    blockItem,
+    slabItem,
+    stage
+  } = config;
+
+  const perpX = -dirZ;
+  const perpZ = dirX;
+  const topY = startY + rise;
+  const placedPositions = [];
+
+  for (let stepIndex = 0; stepIndex < rise * 2; stepIndex += 1) {
+    const blockY = startY + 1 + Math.floor(stepIndex / 2);
+    const forwardOffset = stepIndex + 1;
+    const stepStartX = startX + dirX * forwardOffset;
+    const stepStartZ = startZ + dirZ * forwardOffset;
+    const useSlab = stepIndex % 2 === 0;
+    const item = useSlab ? slabItem : blockItem;
+
+    for (let widthOffset = 0; widthOffset < width; widthOffset += 1) {
+      const x = stepStartX + perpX * widthOffset;
+      const z = stepStartZ + perpZ * widthOffset;
+
+      for (let supportY = startY; supportY < blockY; supportY += 1) {
+        setPlacementData({
+          x,
+          y: supportY,
+          z,
+          item: supportItem,
+          stage
+        });
+      }
+
+      const placement = {
+        x,
+        y: blockY,
+        z,
+        item,
+        stage
+      };
+      if (useSlab) {
+        placement.placeOptions = {
+          half: "bottom"
+        };
+      }
+      setPlacementData(placement);
+      placedPositions.push({ x, y: blockY, z });
+
+      clearPlacement(x, blockY + 1, z);
+      clearPlacement(x, blockY + 2, z);
+    }
+  }
+
+  return {
+    topY,
+    placedPositions
+  };
 }
 
 async function ensurePlacementInventory(bot, placements, extraRequirements) {
@@ -1445,6 +1545,10 @@ function buildRusticBalconyHousePlacements(originX, originY, originZ, palette) {
   setPlacement(originX + 9, originY + 1, originZ, doorItem);
 
   fillRect(originX + 4, originX + 6, originY + 1, balconyZ, originZ + 2, floorItem);
+  fillRect(originX + 2, originX + 8, originY + 3, balconyZ, balconyZ, beamItem);
+  fillColumn(originX + 2, originY + 1, originY + 2, balconyZ, beamItem);
+  fillColumn(originX + 5, originY + 1, originY + 2, balconyZ, beamItem);
+  fillColumn(originX + 8, originY + 1, originY + 2, balconyZ, beamItem);
   fillColumn(originX + 2, originY + 1, originY + 3, originZ, beamItem);
   fillColumn(originX + 8, originY + 1, originY + 3, originZ, beamItem);
   fillColumn(originX + 4, originY + 1, originY + 2, frontPathZ, beamItem);
@@ -1453,6 +1557,12 @@ function buildRusticBalconyHousePlacements(originX, originY, originZ, palette) {
   setPlacement(originX + 6, originY + 3, frontPathZ, lightItem);
   setPlacement(originX + 1, originY + 1, frontPathZ, leafItem);
   setPlacement(originX + 9, originY + 1, frontPathZ, leafItem);
+
+  for (let y = originY + 1; y <= upperFloorY; y += 1) {
+    for (let z = originZ + 2; z <= originZ + 5; z += 1) {
+      setPlacement(originX + 1, y, z, wallItem);
+    }
+  }
 
   for (let z = frontLeftZ; z <= backRightZ; z += 1) {
     for (let x = originX + 1; x <= originX + 9; x += 1) {
@@ -1518,18 +1628,28 @@ function buildRusticBalconyHousePlacements(originX, originY, originZ, palette) {
   setPlacement(originX + 6, upperWallStartY, balconyZ, lightItem);
 
   const roofTiers = [
-    { y: roofBaseY, x1: frontLeftX, x2: backRightX },
-    { y: roofBaseY + 1, x1: frontLeftX + 1, x2: backRightX - 1 },
-    { y: roofBaseY + 2, x1: frontLeftX + 2, x2: backRightX - 2 },
-    { y: roofBaseY + 3, x1: frontLeftX + 3, x2: backRightX - 3 },
-    { y: roofBaseY + 4, x1: frontLeftX + 4, x2: backRightX - 4 }
+    { y: roofBaseY, x1: frontLeftX + 1, x2: backRightX - 1, z1: frontLeftZ + 1, z2: backRightZ },
+    { y: roofBaseY + 1, x1: frontLeftX + 2, x2: backRightX - 2, z1: frontLeftZ + 1, z2: backRightZ },
+    { y: roofBaseY + 2, x1: frontLeftX + 3, x2: backRightX - 3, z1: frontLeftZ + 1, z2: backRightZ },
+    { y: roofBaseY + 3, x1: frontLeftX + 4, x2: backRightX - 4, z1: frontLeftZ + 1, z2: backRightZ },
+    { y: roofBaseY + 4, x1: frontLeftX + 5, x2: backRightX - 5, z1: frontLeftZ + 1, z2: backRightZ }
   ];
 
   for (const roofTier of roofTiers) {
-    fillRect(roofTier.x1, roofTier.x2, roofTier.y, frontLeftZ, backRightZ, roofItem);
+    fillRect(roofTier.x1, roofTier.x2, roofTier.y, roofTier.z1, roofTier.z2, roofItem);
   }
 
-  for (let z = frontLeftZ; z <= backRightZ; z += 1) {
+  const frontGableTiers = [
+    { y: roofBaseY, x1: originX + 3, x2: originX + 7 },
+    { y: roofBaseY + 1, x1: originX + 4, x2: originX + 6 },
+    { y: roofBaseY + 2, x1: originX + 5, x2: originX + 5 }
+  ];
+
+  for (const frontGableTier of frontGableTiers) {
+    fillRect(frontGableTier.x1, frontGableTier.x2, frontGableTier.y, frontLeftZ, frontLeftZ, roofItem);
+  }
+
+  for (let z = frontLeftZ + 1; z <= backRightZ; z += 1) {
     setPlacement(originX + 5, roofBaseY + 4, z, roofAccentItem);
   }
 
@@ -2361,7 +2481,7 @@ async function buildRusticBalconyHouse(body) {
         const leftDistance = Math.abs(left.x - roofCenterX) + Math.abs(left.z - roofCenterZ);
         const rightDistance = Math.abs(right.x - roofCenterX) + Math.abs(right.z - roofCenterZ);
         if (leftDistance !== rightDistance) {
-          return leftDistance - rightDistance;
+          return rightDistance - leftDistance;
         }
 
         if (left.z !== right.z) {
