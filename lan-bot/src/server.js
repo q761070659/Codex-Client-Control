@@ -1529,7 +1529,7 @@ async function farmStoreFive(body) {
       throw new Error("farm center support missing at " + blockKey(centerX, supportY, centerZ));
     }
 
-    await clearBlockIfNeeded(bot, centerX, cropY, centerZ, range, useDelayMs);
+    await clearBlockIfNeeded(bot, centerX, cropY, centerZ, range, useDelayMs, ["water"]);
     await placeWaterSourceByHand(bot, waterItem, centerX, cropY, centerZ, range, useDelayMs);
     results.waterPlaced = true;
 
