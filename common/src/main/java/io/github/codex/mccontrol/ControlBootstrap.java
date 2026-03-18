@@ -15,6 +15,23 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * Mod 引导启动类，负责异步初始化控制服务器。
+ *
+ * <p>此类处理以下初始化任务：</p>
+ * <ul>
+ *   <li>等待 Minecraft 客户端准备就绪（最多 180 秒）</li>
+ *   <li>加载配置文件</li>
+ *   <li>创建调度线程池</li>
+ *   <li>启动 HTTP/WebSocket 服务器</li>
+ * </ul>
+ *
+ * <p>启动过程通过诊断日志文件记录，便于排查启动失败问题。
+ * 诊断日志文件位于游戏目录下的 {@code codex-client-control-bootstrap.log}。</p>
+ *
+ * @see ControlHttpServer
+ * @see ControlConfig
+ */
 public final class ControlBootstrap {
     private static final AtomicBoolean STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean STARTING = new AtomicBoolean(false);
@@ -23,6 +40,23 @@ public final class ControlBootstrap {
     private ControlBootstrap() {
     }
 
+    /**
+     * 异步启动控制服务器。
+     *
+     * <p>此方法会立即返回，在单独的线程中执行初始化逻辑。
+     * 如果服务器已经启动或正在启动，则忽略此次调用。</p>
+     *
+     * <p>启动过程包括：</p>
+     * <ol>
+     *   <li>等待 Minecraft 客户端准备就绪（最多 180 秒，每秒检查一次）</li>
+     *   <li>加载配置文件（如果不存在则创建默认配置）</li>
+     *   <li>启动 HTTP/WebSocket 服务器</li>
+     * </ol>
+     *
+     * <p>启动结果会记录到诊断日志文件中。</p>
+     *
+     * @param logger 用于输出启动日志的 Logger 实例
+     */
     public static void startAsync(Logger logger) {
         appendDiagnostic("startAsync invoked", null);
         if (STARTED.get()) {
@@ -130,6 +164,8 @@ public final class ControlBootstrap {
                 StandardOpenOption.APPEND
             );
         } catch (Exception ignored) {
+            Logger.getLogger(ControlBootstrap.class.getName())
+                .log(Level.WARNING, "Failed to write diagnostic log", ignored);
         }
     }
 

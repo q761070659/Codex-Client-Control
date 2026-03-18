@@ -26,6 +26,27 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+/**
+ * Minecraft 客户端桥接层，提供与游戏客户端交互的反射接口。
+ *
+ * <p>此类封装了所有对 Minecraft 内部 API 的反射调用，包括：</p>
+ * <ul>
+ *   <li>玩家状态查询（位置、血量、饥饿值等）</li>
+ *   <li>GUI 交互（屏幕、容器、Widgets）</li>
+ *   <li>输入控制（键盘、鼠标、视角）</li>
+ *   <li>聊天消息发送</li>
+ *   <li>调试用假玩家管理</li>
+ *   <li>截图功能</li>
+ * </ul>
+ *
+ * <p>所有需要访问 Minecraft 客户端状态的操作都通过 {@link #onClientThread(ReflectiveCallable)}
+ * 方法在客户端主线程执行，确保线程安全。</p>
+ *
+ * <p><b>注意：</b>此类依赖 Minecraft 内部 API 的字段和方法名，不同版本可能需要更新映射。</p>
+ *
+ * @see ControlHttpServer
+ * @see ControlBootstrap
+ */
 public final class MinecraftBridge {
     private static final String[] MOVEMENT_KEYS = { "forward", "back", "left", "right", "jump", "sneak", "sprint", "use", "attack" };
 
@@ -359,12 +380,36 @@ public final class MinecraftBridge {
         entityDiscardedRemovalReason = findFieldAny(entityRemovalReasonClass, "DISCARDED", "b").get(null);
     }
 
+    /**
+     * 获取 Minecraft 游戏目录路径。
+     *
+     * @return 游戏根目录的 Path 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Path getGameDirectory() throws ReflectiveOperationException {
         Object minecraft = getMinecraft();
         File directory = (File) minecraftGameDirectoryField.get(minecraft);
         return directory.toPath();
     }
 
+    /**
+     * 获取当前玩家状态信息。
+     *
+     * <p>返回的地图包含以下键值：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code screen} - 当前屏幕摘要</li>
+     *   <li>{@code inWorld} - 玩家是否在世界中</li>
+     *   <li>{@code x, y, z} - 玩家坐标（如果已在世界中）</li>
+     *   <li>{@code yaw, pitch} - 视角旋转角度</li>
+     *   <li>{@code health, maxHealth} - 生命值信息</li>
+     *   <li>{@code food, saturation} - 饥饿度信息</li>
+     *   <li>{@code selectedHotbarSlot} - 当前热键栏位置 (1-9)</li>
+     * </ul>
+     *
+     * @return 包含玩家状态的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getStatus() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
@@ -373,6 +418,14 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取聊天消息历史。
+     *
+     * @param sinceExclusive 返回序列号大于此值的消息，-1 表示返回所有消息
+     * @param limit 返回消息的最大数量
+     * @return 包含聊天消息和历史记录的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getChat(long sinceExclusive, int limit) throws ReflectiveOperationException {
         long safeSinceExclusive = Math.max(-1L, sinceExclusive);
         int safeLimit = Math.max(1, limit);
@@ -382,6 +435,23 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取当前屏幕快照。
+     *
+     * <p>返回当前打开的 GUI 屏幕信息，包括：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code screen.open} - 是否有屏幕打开</li>
+     *   <li>{@code screen.className} - 屏幕类的完全限定名</li>
+     *   <li>{@code screen.title} - 屏幕标题</li>
+     *   <li>{@code screen.width, screen.height} - 屏幕尺寸</li>
+     *   <li>{@code screen.canCloseOnEsc} - 是否可以按 ESC 关闭</li>
+     *   <li>{@code widgets} - 可见的组件列表</li>
+     * </ul>
+     *
+     * @return 包含屏幕快照的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getScreenSnapshot() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
@@ -392,6 +462,24 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取十字线瞄准目标信息。
+     *
+     * <p>返回当前准星瞄准的方块或实体信息：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code inWorld} - 玩家是否在世界中</li>
+     *   <li>{@code screen} - 当前屏幕摘要</li>
+     *   <li>{@code type} - 目标类型 (BLOCK, ENTITY, MISS)</li>
+     *   <li>{@code hit} - 是否命中实体或方块</li>
+     *   <li>{@code location} - 命中位置的 Vec3 坐标</li>
+     *   <li>{@code block} - 方块信息（如果是方块）</li>
+     *   <li>{@code entity} - 实体信息（如果是实体）</li>
+     * </ul>
+     *
+     * @return 包含瞄准目标的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getCrosshairTarget() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
@@ -402,6 +490,22 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取当前打开的容器内容。
+     *
+     * <p>当玩家打开物品栏、箱子或其他容器界面时可用，返回：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code screen} - 当前屏幕摘要</li>
+     *   <li>{@code containerOpen} - 是否有容器打开</li>
+     *   <li>{@code className} - 容器类名</li>
+     *   <li>{@code slots} - 槽位列表，每个槽位包含位置、物品信息</li>
+     *   <li>{@code carried} - 鼠标持有的物品</li>
+     * </ul>
+     *
+     * @return 包含容器内容的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getContainerContents() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
@@ -410,6 +514,20 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取玩家列表（Tab 列表）。
+     *
+     * <p>返回当前服务器的玩家列表信息：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code inWorld} - 玩家是否在世界中</li>
+     *   <li>{@code count} - 玩家数量</li>
+     *   <li>{@code players} - 玩家信息列表，包含 name、uuid、latency、gameMode、displayName</li>
+     * </ul>
+     *
+     * @return 包含玩家列表的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getPlayerList() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
@@ -418,6 +536,24 @@ public final class MinecraftBridge {
         });
     }
 
+    /**
+     * 获取游戏完整状态快照。
+     *
+     * <p>一次性返回所有状态信息，适合需要完整状态的高层 API：</p>
+     * <ul>
+     *   <li>{@code ok} - 操作是否成功</li>
+     *   <li>{@code status} - 玩家状态</li>
+     *   <li>{@code screen} - 屏幕快照</li>
+     *   <li>{@code target} - 十字线目标</li>
+     *   <li>{@code container} - 容器内容</li>
+     *   <li>{@code players} - 玩家列表</li>
+     *   <li>{@code chat} - 聊天历史</li>
+     * </ul>
+     *
+     * @param chatLimit 聊天历史返回的最大消息数
+     * @return 包含完整状态的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> getFullState(int chatLimit) throws ReflectiveOperationException {
         int safeChatLimit = Math.max(1, chatLimit);
         return onClientThread(() -> {
@@ -586,6 +722,15 @@ public final class MinecraftBridge {
         return payload;
     }
 
+    /**
+     * 截取游戏截图。
+     *
+     * <p>调用 Minecraft 内置截图功能，保存截图到游戏目录的 screenshots 文件夹。</p>
+     *
+     * @param requestedName 请求的截图文件名，如果为 null 或空则自动生成
+     * @return 包含截图文件名和路径的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> takeScreenshot(String requestedName) throws ReflectiveOperationException {
         Path gameDirectory = getGameDirectory();
         String fileName = normalizeScreenshotName(requestedName);
@@ -638,6 +783,14 @@ public final class MinecraftBridge {
         }
     }
 
+    /**
+     * 列出当前已生成的调试用假玩家。
+     *
+     * <p>这些假玩家是由本 Mod 生成的，仅存在于本地客户端，不会上传到服务器。</p>
+     *
+     * @return 包含假玩家列表的 Map 对象
+     * @throws ReflectiveOperationException 当反射调用失败时抛出
+     */
     public Map<String, Object> listDebugFakePlayers() throws ReflectiveOperationException {
         return onClientThread(() -> {
             Object level = minecraftLevelField.get(getMinecraft());

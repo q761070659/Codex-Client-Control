@@ -9,7 +9,31 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.UUID;
 
+/**
+ * 控制服务器配置数据类。
+ *
+ * <p>使用 Java Record 实现不可变配置对象，包含：</p>
+ * <ul>
+ *   <li>{@code host} - 服务器绑定地址，默认为 127.0.0.1</li>
+ *   <li>{@code port} - 服务器监听端口，默认为 47862</li>
+ *   <li>{@code token} - API 认证令牌，自动生成 UUID</li>
+ * </ul>
+ *
+ * <p>配置通过 {@link #load(Path)} 方法从文件加载，如文件不存在则创建默认配置。</p>
+ *
+ * @see ControlBootstrap
+ */
 public record ControlConfig(String host, int port, String token) {
+
+    /**
+     * 从指定路径加载配置文件。
+     *
+     * <p>如果文件不存在，将创建默认配置文件。</p>
+     *
+     * @param path 配置文件路径
+     * @return 加载的配置对象
+     * @throws IOException 当文件操作失败时抛出
+     */
     public static ControlConfig load(Path path) throws IOException {
         Objects.requireNonNull(path, "path");
         Files.createDirectories(path.getParent());

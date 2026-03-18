@@ -1,7 +1,15 @@
 pluginManagement {
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id in ['fabric-loom', 'net.fabricmc.fabric-loom', 'net.fabricmc.fabric-loom-remap']) {
+                useModule("net.fabricmc:fabric-loom:${requested.version}")
+            }
+        }
+    }
+
     repositories {
-        mavenCentral()
-        gradlePluginPortal()
+        maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url = 'https://maven.aliyun.com/repository/central' }
         maven {
             name = 'Fabric'
             url = 'https://maven.fabricmc.net/'
@@ -15,7 +23,7 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
-        mavenCentral()
+        maven { url = 'https://maven.aliyun.com/repository/central' }
         maven {
             name = 'Fabric'
             url = 'https://maven.fabricmc.net/'

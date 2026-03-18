@@ -1,5 +1,5 @@
 plugins {
-    id 'net.neoforged.gradle.userdev' version '21.11.38-beta'
+    id 'net.neoforged.gradle.userdev' version '7.1.21'
 }
 
 group = rootProject.maven_group
@@ -18,9 +18,7 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 dependencies {
-    minecraft "net.minecraft:client:${rootProject.minecraft_version}"
-    neoforge "net.neoforged:neoforge:${rootProject.neoforge_version}"
-    
+    implementation "net.neoforged:neoforge:${rootProject.neoforge_version}"
     implementation project(':common')
 }
 
@@ -38,7 +36,4 @@ processResources {
 
 tasks.named('jar', Jar) {
     archiveBaseName.set("${rootProject.archives_base_name}-neoforge")
-    from(rootProject.file("LICENSE")) {
-        rename { "${it}_${project.archivesBaseName}" }
-    }
 }

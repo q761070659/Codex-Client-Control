@@ -22,13 +22,15 @@ allprojects {
 }
 
 subprojects {
-    archivesBaseName = "${project.archives_base_name}-${project.name}"
+    base {
+        archivesName.set("${project.archives_base_name}-${project.name}")
+    }
 
     // Only include LICENSE in final mod jars, not in common module
     if (project.name != 'common') {
         jar {
             from(rootProject.file("LICENSE")) {
-                rename { "${it}_${project.archivesBaseName}" }
+                rename { "${it}_${project.base.archivesName.get()}" }
             }
         }
 
