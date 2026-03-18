@@ -7,6 +7,7 @@ class ActionManager {
     this.state = "idle";
     this.message = "idle";
     this.error = "";
+    this.details = null;
     this.startedAt = 0;
     this.cancelRequested = false;
     this.cancelHook = null;
@@ -26,6 +27,7 @@ class ActionManager {
       label: this.label,
       message: this.message,
       error: this.error,
+      details: this.details,
       startedAt: this.startedAt,
       cancelRequested: this.cancelRequested
     };
@@ -33,6 +35,22 @@ class ActionManager {
 
   isCancelled() {
     return this.cancelRequested;
+  }
+
+  setProgress(message, details) {
+    if (typeof message === "object" && typeof details === "undefined") {
+      details = message;
+      message = "";
+    }
+
+    if (typeof message === "string" && message.length > 0) {
+      this.message = message;
+    }
+    if (typeof details !== "undefined") {
+      this.details = details;
+    }
+
+    return this.snapshot();
   }
 
   async run(label, executor) {
@@ -45,6 +63,7 @@ class ActionManager {
     this.state = "running";
     this.message = "running";
     this.error = "";
+    this.details = null;
     this.startedAt = Date.now();
     this.cancelRequested = false;
 
