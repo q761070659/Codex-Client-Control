@@ -969,6 +969,47 @@ async function sendPlacePacket(bot, support, placeOptions) {
   await bot.placeBlock(support.block, support.face);
 }
 
+async function restoreReplacedBlock(bot, itemName, position, options) {
+  if (!itemName) {
+    return false;
+  }
+
+  const commandBot = options && options.commandBot ? options.commandBot : bot;
+  const range = options && Number.isFinite(options.range) ? options.range : 4;
+  const placeDelayMs = options && Number.isFinite(options.placeDelayMs) ? options.placeDelayMs : 100;
+
+  try {
+    await runBotCommand(
+      commandBot,
+      "/setblock " + String(position.x) + " " + String(position.y) + " " + String(position.z) + " " + itemName
+    );
+    const restoredByCommand = await waitForExpectedBlock(bot, position, itemName, 10, placeDelayMs);
+    if (restoredByCommand && restoredByCommand.name === itemName) {
+      return true;
+    }
+  } catch (error) {
+  }
+
+  try {
+    await ensureInventoryItem(bot, itemName, 1, {
+      commandBot
+    });
+    const support = getPlacementSupport(bot, position.x, position.y, position.z, null);
+    if (!support) {
+      return false;
+    }
+
+    await ensureNear(bot, position.x, position.y, position.z, range);
+    await moveOutOfTargetBlock(bot, position.x, position.y, position.z, support);
+    await equipItemByName(bot, itemName);
+    await sendPlacePacket(bot, support, {});
+    const restored = await waitForExpectedBlock(bot, position, itemName, 12, placeDelayMs);
+    return Boolean(restored && restored.name === itemName);
+  } catch (error) {
+    return false;
+  }
+}
+
 async function placeBlockByHand(bot, placement, options) {
   const x = placement.x;
   const y = placement.y;
@@ -977,9 +1018,12 @@ async function placeBlockByHand(bot, placement, options) {
   const range = options.range;
   const placeDelayMs = options.placeDelayMs;
   const replace = options.replace;
+  const commandBot = options.commandBot || bot;
   const preferredSupport = placement.preferredSupport || options.preferredSupport || null;
   const skipInventoryCheck = Boolean(options.skipInventoryCheck);
-  const inventoryOptions = options.commandBot ? { commandBot: options.commandBot } : null;
+  const inventoryOptions = {
+    commandBot
+  };
   const placeOptions = {
     ...(placement.placeOptions || {}),
     ...(options.placeOptions || {})
@@ -991,6 +1035,7 @@ async function placeBlockByHand(bot, placement, options) {
 
   const targetPos = new Vec3(x, y, z);
   const existing = bot.blockAt(targetPos);
+  const replacedBlockName = existing && !isAir(existing) ? existing.name : "";
   if (existing && existing.name === item) {
     return {
       x,
@@ -1003,54 +1048,74 @@ async function placeBlockByHand(bot, placement, options) {
     };
   }
 
-  if (!isAir(existing)) {
-    if (!replace) {
-      throw new Error("target occupied at " + blockKey(x, y, z) + " by " + existing.name);
-    }
-    await ensureNear(bot, x, y, z, range);
-    await bot.dig(existing, true);
-    await sleep(150);
-  }
-
   const supports = getPlacementSupportCandidates(bot, x, y, z, preferredSupport);
   if (supports.length === 0) {
     throw new Error("no support block near " + blockKey(x, y, z));
   }
 
-  await ensureNear(bot, x, y, z, range);
+  let clearedOriginal = false;
+  try {
+    if (!isAir(existing)) {
+      if (!replace) {
+        throw new Error("target occupied at " + blockKey(x, y, z) + " by " + existing.name);
+      }
+      await ensureNear(bot, x, y, z, range);
+      await bot.dig(existing, true);
+      await sleep(150);
+      const cleared = bot.blockAt(targetPos);
+      if (!isAir(cleared)) {
+        throw new Error("failed to clear target at " + blockKey(x, y, z));
+      }
+      clearedOriginal = true;
+    }
 
-  let lastError = null;
-  for (const support of supports) {
     await ensureNear(bot, x, y, z, range);
-    await moveOutOfTargetBlock(bot, x, y, z, support);
-    await equipItemByName(bot, item);
 
-    try {
-      await sendPlacePacket(bot, support, placeOptions);
-    } catch (error) {
-      lastError = error;
+    let lastError = null;
+    for (const support of supports) {
+      await ensureNear(bot, x, y, z, range);
+      await moveOutOfTargetBlock(bot, x, y, z, support);
+      await equipItemByName(bot, item);
+
+      try {
+        await sendPlacePacket(bot, support, placeOptions);
+      } catch (error) {
+        lastError = error;
+      }
+
+      const placedAfterAttempt = await waitForExpectedBlock(bot, targetPos, item, 12, placeDelayMs);
+      if (placedAfterAttempt && placedAfterAttempt.name === item) {
+        return {
+          x,
+          y,
+          z,
+          item,
+          placed: true,
+          skipped: false,
+          finalBlock: placedAfterAttempt.name
+        };
+      }
     }
 
-    const placedAfterAttempt = await waitForExpectedBlock(bot, targetPos, item, 12, placeDelayMs);
-    if (placedAfterAttempt && placedAfterAttempt.name === item) {
-      return {
-        x,
-        y,
-        z,
-        item,
-        placed: true,
-        skipped: false,
-        finalBlock: placedAfterAttempt.name
-      };
+    const placed = bot.blockAt(targetPos);
+    if (lastError) {
+      throw lastError;
     }
-  }
 
-  const placed = bot.blockAt(targetPos);
-  if (lastError) {
-    throw lastError;
+    throw new Error("place verification failed at " + blockKey(x, y, z) + ", got " + (placed ? placed.name : "air"));
+  } catch (error) {
+    if (clearedOriginal && replacedBlockName) {
+      const restored = await restoreReplacedBlock(bot, replacedBlockName, targetPos, {
+        commandBot,
+        range,
+        placeDelayMs
+      });
+      if (!restored) {
+        logMessage("failed to restore replaced block " + replacedBlockName + " at " + blockKey(x, y, z), "Error");
+      }
+    }
+    throw error;
   }
-
-  throw new Error("place verification failed at " + blockKey(x, y, z) + ", got " + (placed ? placed.name : "air"));
 }
 
 async function clearBlockIfNeeded(bot, x, y, z, range, delayMs) {
@@ -2319,6 +2384,248 @@ function buildImperialPagodaPlacements(originX, originY, originZ, palette) {
   }
 
   return Array.from(placements.values());
+}
+
+function findFlatBuildOrigin(bot, options) {
+  const allowedGround = new Set(["grass_block", "dirt", "coarse_dirt"]);
+  const width = Math.max(8, Math.floor(options.width || 8));
+  const depth = Math.max(8, Math.floor(options.depth || 8));
+  const searchRadius = Math.max(12, Math.floor(options.searchRadius || 96));
+  const sampleStep = Math.max(2, Math.floor(options.sampleStep || 2));
+  const ringStep = Math.max(4, Math.floor(options.ringStep || 6));
+  const currentY = Math.floor(bot.entity.position.y);
+  const baseY = Number.isFinite(options.y) ? Math.floor(options.y) : currentY - 1;
+  const scanMinY = Number.isFinite(options.minY) ? Math.floor(options.minY) : Math.max(-64, baseY - 16);
+  const scanMaxY = Number.isFinite(options.maxY) ? Math.floor(options.maxY) : Math.min(320, currentY + 192);
+  const centerX = Number.isFinite(options.centerX) ? Math.floor(options.centerX) : Math.floor(bot.entity.position.x);
+  const centerZ = Number.isFinite(options.centerZ) ? Math.floor(options.centerZ) : Math.floor(bot.entity.position.z);
+  const surfaceCache = new Map();
+
+  function findSurfaceY(x, z) {
+    const cacheKey = blockKey(x, 0, z);
+    if (surfaceCache.has(cacheKey)) {
+      return surfaceCache.get(cacheKey);
+    }
+
+    for (let y = scanMaxY; y >= scanMinY; y -= 1) {
+      const ground = bot.blockAt(new Vec3(x, y, z));
+      const above = bot.blockAt(new Vec3(x, y + 1, z));
+      const aboveUpper = bot.blockAt(new Vec3(x, y + 2, z));
+      if (ground && allowedGround.has(ground.name) && isAir(above) && isAir(aboveUpper)) {
+        surfaceCache.set(cacheKey, y);
+        return y;
+      }
+    }
+
+    surfaceCache.set(cacheKey, null);
+    return null;
+  }
+
+  function areaIsClear(originX, originZ) {
+    const sampleX = originX + Math.floor(width / 2);
+    const sampleZ = originZ + Math.floor(depth / 2);
+    const targetY = findSurfaceY(sampleX, sampleZ);
+    if (!Number.isFinite(targetY)) {
+      return null;
+    }
+
+    for (let z = 0; z < depth; z += sampleStep) {
+      for (let x = 0; x < width; x += sampleStep) {
+        const ground = bot.blockAt(new Vec3(originX + x, targetY, originZ + z));
+        const above = bot.blockAt(new Vec3(originX + x, targetY + 1, originZ + z));
+        const aboveUpper = bot.blockAt(new Vec3(originX + x, targetY + 2, originZ + z));
+        if (!ground || !allowedGround.has(ground.name) || !isAir(above) || !isAir(aboveUpper)) {
+          return null;
+        }
+      }
+    }
+    return targetY;
+  }
+
+  const candidates = [];
+  for (let radius = ringStep; radius <= searchRadius; radius += ringStep) {
+    for (let dz = -radius; dz <= radius; dz += ringStep) {
+      for (let dx = -radius; dx <= radius; dx += ringStep) {
+        if (Math.abs(dx) !== radius && Math.abs(dz) !== radius) {
+          continue;
+        }
+        candidates.push({
+          x: centerX + dx,
+          z: centerZ + dz
+        });
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    const targetY = areaIsClear(candidate.x, candidate.z);
+    if (Number.isFinite(targetY)) {
+      return {
+        x: candidate.x,
+        y: targetY,
+        z: candidate.z
+      };
+    }
+  }
+
+  throw new Error("could not find a flat empty build area nearby");
+}
+
+function buildReferencePathChainPlacements(originX, originY, originZ, palette) {
+  const placements = new Map();
+  const {
+    segmentCount,
+    segmentLength,
+    pathWidth,
+    dirX,
+    dirZ,
+    stoneMainItem,
+    stoneEdgeItem,
+    stoneAccentItem,
+    dirtMainItem,
+    dirtEdgeItem,
+    dirtAccentItem,
+    postItem,
+    leafItem,
+    lanternItem,
+    shrubItem
+  } = palette;
+
+  const halfWidth = Math.max(2, Math.floor(pathWidth / 2));
+  const perpX = -dirZ;
+  const perpZ = dirX;
+  const totalLength = segmentCount * segmentLength;
+  const centerX = originX + 4;
+  const centerZ = originZ + 4 + halfWidth;
+
+  function setPlacement(x, y, z, item, stage, extra) {
+    placements.set(blockKey(x, y, z), {
+      x,
+      y,
+      z,
+      item,
+      stage,
+      ...(extra || {})
+    });
+  }
+
+  function fillLeafCross(baseX, baseY, baseZ) {
+    const offsets = [
+      [0, 0, 0],
+      [1, 0, 0],
+      [-1, 0, 0],
+      [0, 0, 1],
+      [0, 0, -1],
+      [0, 1, 0],
+      [1, 1, 0],
+      [-1, 1, 0],
+      [0, 1, 1],
+      [0, 1, -1]
+    ];
+
+    for (const [dx, dy, dz] of offsets) {
+      setPlacement(baseX + dx, baseY + dy, baseZ + dz, leafItem, "decor");
+    }
+  }
+
+  function addTreePair(stepIndex) {
+    const anchorX = centerX + dirX * stepIndex;
+    const anchorZ = centerZ + dirZ * stepIndex;
+    const leftX = anchorX + perpX * (halfWidth + 3);
+    const leftZ = anchorZ + perpZ * (halfWidth + 3);
+    const rightX = anchorX - perpX * (halfWidth + 3);
+    const rightZ = anchorZ - perpZ * (halfWidth + 3);
+
+    for (let y = originY + 1; y <= originY + 4; y += 1) {
+      setPlacement(leftX, y, leftZ, postItem, "posts");
+      setPlacement(rightX, y, rightZ, postItem, "posts");
+    }
+
+    setPlacement(leftX, originY + 5, leftZ, lanternItem, "decor");
+    setPlacement(rightX, originY + 5, rightZ, lanternItem, "decor");
+    fillLeafCross(leftX, originY + 5, leftZ);
+    fillLeafCross(rightX, originY + 5, rightZ);
+  }
+
+  function addShrubPair(stepIndex) {
+    const anchorX = centerX + dirX * stepIndex;
+    const anchorZ = centerZ + dirZ * stepIndex;
+    const leftX = anchorX + perpX * (halfWidth + 2);
+    const leftZ = anchorZ + perpZ * (halfWidth + 2);
+    const rightX = anchorX - perpX * (halfWidth + 2);
+    const rightZ = anchorZ - perpZ * (halfWidth + 2);
+
+    setPlacement(leftX, originY + 1, leftZ, shrubItem, "decor");
+    setPlacement(rightX, originY + 1, rightZ, shrubItem, "decor");
+  }
+
+  function groundItemFor(style, lateral, stepIndex) {
+    const absLateral = Math.abs(lateral);
+    if (style === "stone") {
+      if (absLateral === 0) {
+        return stoneMainItem;
+      }
+      if (absLateral === halfWidth) {
+        return stepIndex % 2 === 0 ? stoneEdgeItem : stoneAccentItem;
+      }
+      return (stepIndex + lateral) % 2 === 0 ? stoneAccentItem : stoneMainItem;
+    }
+
+    if (absLateral === 0) {
+      return dirtMainItem;
+    }
+    if (absLateral === halfWidth) {
+      return dirtEdgeItem;
+    }
+    return (stepIndex + lateral) % 3 === 0 ? dirtAccentItem : dirtMainItem;
+  }
+
+  for (let segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
+    const style = segmentIndex % 2 === 0 ? "stone" : "dirt";
+    const segmentStart = segmentIndex * segmentLength;
+
+    for (let localStep = 0; localStep < segmentLength; localStep += 1) {
+      const stepIndex = segmentStart + localStep;
+      const pathX = centerX + dirX * stepIndex;
+      const pathZ = centerZ + dirZ * stepIndex;
+
+      for (let lateral = -halfWidth; lateral <= halfWidth; lateral += 1) {
+        const x = pathX + perpX * lateral;
+        const z = pathZ + perpZ * lateral;
+        setPlacement(x, originY, z, groundItemFor(style, lateral, stepIndex), "ground");
+      }
+
+      if (localStep === 0 && segmentIndex > 0) {
+        for (let lateral = -halfWidth - 1; lateral <= halfWidth + 1; lateral += 1) {
+          const seamX = pathX + perpX * lateral;
+          const seamZ = pathZ + perpZ * lateral;
+          const blendItem = style === "stone" ? stoneEdgeItem : dirtEdgeItem;
+          setPlacement(seamX, originY, seamZ, blendItem, "ground");
+        }
+      }
+
+      if (style === "stone" && localStep % 5 === 2) {
+        addTreePair(stepIndex);
+      }
+      if (style === "dirt" && localStep % 4 === 1) {
+        addShrubPair(stepIndex);
+      }
+    }
+  }
+
+  return {
+    placements: Array.from(placements.values()),
+    totalLength,
+    center: {
+      x: centerX + dirX * Math.floor(totalLength / 2),
+      y: originY + 1,
+      z: centerZ + dirZ * Math.floor(totalLength / 2)
+    },
+    footprint: {
+      width: totalLength + 8,
+      depth: pathWidth + 12
+    }
+  };
 }
 
 function countInventoryItem(bot, itemName) {
@@ -3741,6 +4048,482 @@ async function buildImperialPagoda(body) {
   });
 }
 
+async function buildReferencePathChain(body) {
+  return actionManager.run("build_reference_path_chain", async (manager) => {
+    const bot = requireBot();
+    const connectOptions = state.botOptions || config.bot;
+    const segmentCount = Math.max(2, Math.floor(numberValue(body, "segmentCount", 6)));
+    const segmentLength = Math.max(6, Math.floor(numberValue(body, "segmentLength", 10)));
+    const pathWidth = Math.max(5, Math.floor(numberValue(body, "pathWidth", 7)));
+    const requestedWorkers = Math.max(1, Math.floor(numberValue(body, "workers", 4)));
+    const helperPrefix = stringValue(body, "helperPrefix", bot.username.slice(0, 12));
+    const workerMode = String(stringValue(body, "workerMode", "lanes")).toLowerCase();
+    const range = numberValue(body, "range", 5);
+    const placeDelayMs = numberValue(body, "placeDelayMs", 50);
+    const continueOnError = boolValue(body, "continueOnError", true);
+    const dirXRaw = Math.sign(numberValue(body, "dirX", 1));
+    const dirZRaw = Math.sign(numberValue(body, "dirZ", 0));
+    const dirX = dirXRaw === 0 && dirZRaw === 0 ? 1 : dirXRaw;
+    const dirZ = dirXRaw === 0 && dirZRaw === 0 ? 0 : dirZRaw;
+    const searchRadius = numberValue(body, "searchRadius", 96);
+    const stoneMainItem = stringValue(body, "stoneMainItem", "stone_bricks");
+    const stoneEdgeItem = stringValue(body, "stoneEdgeItem", "gravel");
+    const stoneAccentItem = stringValue(body, "stoneAccentItem", "cobblestone");
+    const dirtMainItem = stringValue(body, "dirtMainItem", "coarse_dirt");
+    const dirtEdgeItem = stringValue(body, "dirtEdgeItem", "gravel");
+    const dirtAccentItem = stringValue(body, "dirtAccentItem", "dirt");
+    const postItem = stringValue(body, "postItem", "oak_log");
+    const leafItem = stringValue(body, "leafItem", "oak_leaves");
+    const lanternItem = stringValue(body, "lanternItem", "lantern");
+    const shrubItem = stringValue(body, "shrubItem", "moss_block");
+
+    if (!["auto", "lanes", "grid", "round_robin"].includes(workerMode)) {
+      throw new Error("invalid workerMode: " + workerMode);
+    }
+    if (Math.abs(dirX) + Math.abs(dirZ) !== 1) {
+      throw new Error("dirX/dirZ must describe one horizontal axis");
+    }
+
+    let originX;
+    let originY;
+    let originZ;
+    if ("x" in body && "y" in body && "z" in body) {
+      originX = Math.floor(numberValue(body, "x"));
+      originY = Math.floor(numberValue(body, "y"));
+      originZ = Math.floor(numberValue(body, "z"));
+    } else {
+      const found = findFlatBuildOrigin(bot, {
+        width: segmentCount * segmentLength + 12,
+        depth: pathWidth + 12,
+        searchRadius
+      });
+      originX = found.x;
+      originY = found.y;
+      originZ = found.z;
+    }
+
+    const pathPlan = buildReferencePathChainPlacements(originX, originY, originZ, {
+      segmentCount,
+      segmentLength,
+      pathWidth,
+      dirX,
+      dirZ,
+      stoneMainItem,
+      stoneEdgeItem,
+      stoneAccentItem,
+      dirtMainItem,
+      dirtEdgeItem,
+      dirtAccentItem,
+      postItem,
+      leafItem,
+      lanternItem,
+      shrubItem
+    });
+    const placements = pathPlan.placements;
+    const stageOrder = ["ground", "posts", "decor"];
+    const stageTargets = {
+      ground: pathPlan.center,
+      posts: { x: pathPlan.center.x, y: pathPlan.center.y + 2, z: pathPlan.center.z },
+      decor: { x: pathPlan.center.x, y: pathPlan.center.y + 4, z: pathPlan.center.z }
+    };
+    const results = [];
+    const helperBots = [];
+    const workerBots = [bot];
+    let placedCount = 0;
+    let failureCount = 0;
+    const workerFallbackTarget = {
+      x: pathPlan.center.x,
+      y: pathPlan.center.y + 1,
+      z: pathPlan.center.z
+    };
+
+    function buildBounds(list) {
+      if (!list || list.length === 0) {
+        return null;
+      }
+
+      const bounds = {
+        minX: list[0].x,
+        maxX: list[0].x,
+        minY: list[0].y,
+        maxY: list[0].y,
+        minZ: list[0].z,
+        maxZ: list[0].z
+      };
+
+      for (const placement of list) {
+        bounds.minX = Math.min(bounds.minX, placement.x);
+        bounds.maxX = Math.max(bounds.maxX, placement.x);
+        bounds.minY = Math.min(bounds.minY, placement.y);
+        bounds.maxY = Math.max(bounds.maxY, placement.y);
+        bounds.minZ = Math.min(bounds.minZ, placement.z);
+        bounds.maxZ = Math.max(bounds.maxZ, placement.z);
+      }
+
+      return bounds;
+    }
+
+    function sortWorkerPlacements(list, primaryAxis, secondaryAxis) {
+      return list.slice().sort((left, right) => {
+        if (left.y !== right.y) {
+          return left.y - right.y;
+        }
+        if (left[secondaryAxis] !== right[secondaryAxis]) {
+          return left[secondaryAxis] - right[secondaryAxis];
+        }
+        return left[primaryAxis] - right[primaryAxis];
+      });
+    }
+
+    async function teleportWorkerNearChunk(workerBot, bounds, fallbackTarget) {
+      const target = bounds ? {
+        x: bounds.minX,
+        y: bounds.maxY + 2,
+        z: bounds.minZ
+      } : fallbackTarget;
+
+      await runBotCommand(
+        bot,
+        "/tp " + workerBot.username + " " + String(target.x) + " " + String(target.y) + " " + String(target.z)
+      );
+      await sleep(250);
+    }
+
+    function splitPlacementsForWorkers(list, botCount) {
+      const emptyPlan = {
+        strategy: "empty",
+        chunks: Array.from({ length: botCount }, () => [])
+      };
+
+      if (botCount <= 1) {
+        return {
+          strategy: "single",
+          chunks: [sortPlacements(list)]
+        };
+      }
+      if (!list || list.length === 0) {
+        return emptyPlan;
+      }
+
+      const bounds = buildBounds(list);
+      const width = bounds.maxX - bounds.minX + 1;
+      const depth = bounds.maxZ - bounds.minZ + 1;
+      const effectiveMode = workerMode === "auto"
+        ? (width >= depth ? "lanes" : "grid")
+        : workerMode;
+
+      if (effectiveMode === "round_robin") {
+        const chunks = Array.from({ length: botCount }, () => []);
+        const ordered = list.slice().sort((left, right) => {
+          if (left.x !== right.x) {
+            return left.x - right.x;
+          }
+          if (left.z !== right.z) {
+            return left.z - right.z;
+          }
+          return left.y - right.y;
+        });
+
+        ordered.forEach((placement, index) => {
+          chunks[index % botCount].push(placement);
+        });
+
+        return {
+          strategy: "round_robin",
+          chunks: chunks.map((chunk) => sortPlacements(chunk))
+        };
+      }
+
+      if (effectiveMode === "grid") {
+        const columns = Math.max(1, Math.min(botCount, Math.ceil(Math.sqrt(botCount))));
+        const rows = Math.max(1, Math.ceil(botCount / columns));
+        const spanX = Math.max(1, bounds.maxX - bounds.minX + 1);
+        const spanZ = Math.max(1, bounds.maxZ - bounds.minZ + 1);
+        const chunks = Array.from({ length: botCount }, () => []);
+
+        for (const placement of list) {
+          const column = Math.min(columns - 1, Math.floor(((placement.x - bounds.minX) * columns) / spanX));
+          const row = Math.min(rows - 1, Math.floor(((placement.z - bounds.minZ) * rows) / spanZ));
+          let index = row * columns + column;
+          if (index >= botCount) {
+            index = botCount - 1;
+          }
+          chunks[index].push(placement);
+        }
+
+        return {
+          strategy: String(rows) + "x" + String(columns) + "_grid",
+          chunks: chunks.map((chunk) => sortWorkerPlacements(chunk, "x", "z"))
+        };
+      }
+
+      const primaryAxis = Math.abs(dirX) === 1 ? "x" : "z";
+      const secondaryAxis = primaryAxis === "x" ? "z" : "x";
+      const minCoordinate = primaryAxis === "x" ? bounds.minX : bounds.minZ;
+      const span = Math.max(1, (primaryAxis === "x" ? bounds.maxX : bounds.maxZ) - minCoordinate + 1);
+      const chunks = Array.from({ length: botCount }, () => []);
+
+      for (const placement of list) {
+        const coordinate = primaryAxis === "x" ? placement.x : placement.z;
+        const ratioIndex = Math.floor(((coordinate - minCoordinate) * botCount) / span);
+        const index = Math.max(0, Math.min(botCount - 1, ratioIndex));
+        chunks[index].push(placement);
+      }
+
+      return {
+        strategy: primaryAxis + "_lanes",
+        chunks: chunks.map((chunk) => sortWorkerPlacements(chunk, primaryAxis, secondaryAxis))
+      };
+    }
+
+    function snapshotStageProgress(stageName, stageRange, stageStrategy, stageWorkers, stageStatus) {
+      return {
+        name: stageName,
+        range: stageRange,
+        strategy: stageStrategy,
+        total: stageStatus.total,
+        completed: stageStatus.completed,
+        placedCount: stageStatus.placedCount,
+        failureCount: stageStatus.failureCount,
+        workers: stageWorkers.map((entry) => ({
+          username: entry.username,
+          assigned: entry.assigned,
+          completed: entry.completed,
+          placedCount: entry.placedCount,
+          failureCount: entry.failureCount,
+          bounds: entry.bounds
+        }))
+      };
+    }
+
+    function updateBuildProgress(message, extra) {
+      manager.setProgress(message, {
+        action: "build_reference_path_chain",
+        workerMode,
+        requestedWorkers,
+        connectedWorkers: workerBots.map((entry) => entry.username),
+        placedCount,
+        failureCount,
+        ...(extra || {})
+      });
+    }
+
+    async function placeStageChunk(workerBot, chunk, stageName, stageRange, stageStatus, workerState, publishProgress, shouldStop) {
+      for (const placement of chunk) {
+        if (manager.isCancelled()) {
+          throw new Error("action cancelled");
+        }
+        if (shouldStop()) {
+          return false;
+        }
+
+        try {
+          const result = await placeBlockByHand(workerBot, placement, {
+            range: stageRange,
+            placeDelayMs,
+            replace: true,
+            skipInventoryCheck: true,
+            commandBot: bot
+          });
+          results.push({
+            ...result,
+            worker: workerBot.username,
+            success: true
+          });
+          placedCount += 1;
+          stageStatus.completed += 1;
+          stageStatus.placedCount += 1;
+          workerState.completed += 1;
+          workerState.placedCount += 1;
+        } catch (error) {
+          results.push({
+            x: placement.x,
+            y: placement.y,
+            z: placement.z,
+            item: placement.item,
+            worker: workerBot.username,
+            success: false,
+            error: error && error.message ? error.message : String(error)
+          });
+          failureCount += 1;
+          stageStatus.completed += 1;
+          stageStatus.failureCount += 1;
+          workerState.completed += 1;
+          workerState.failureCount += 1;
+          publishProgress();
+          if (!continueOnError) {
+            return false;
+          }
+        }
+
+        publishProgress();
+      }
+
+      return true;
+    }
+
+    async function placeStage(stageName) {
+      const list = sortPlacements(placements.filter((placement) => placement.stage === stageName));
+      const stageRange = range;
+      const stageBots = workerBots.slice();
+      const splitPlan = splitPlacementsForWorkers(list, stageBots.length);
+      const chunks = splitPlan.chunks;
+      const stageStatus = {
+        total: list.length,
+        completed: 0,
+        placedCount: 0,
+        failureCount: 0
+      };
+      const stageWorkers = stageBots.map((workerBot, index) => ({
+        username: workerBot.username,
+        assigned: (chunks[index] || []).length,
+        completed: 0,
+        placedCount: 0,
+        failureCount: 0,
+        bounds: buildBounds(chunks[index] || [])
+      }));
+      let lastPublishedCount = -1;
+      let stopRequested = false;
+
+      const publishProgress = (force) => {
+        if (!force && stageStatus.completed === lastPublishedCount) {
+          return;
+        }
+        if (!force && stageStatus.completed !== stageStatus.total && stageStatus.completed % 16 !== 0) {
+          return;
+        }
+
+        lastPublishedCount = stageStatus.completed;
+        updateBuildProgress("stage " + stageName + " " + String(stageStatus.completed) + "/" + String(stageStatus.total), {
+          stage: snapshotStageProgress(stageName, stageRange, splitPlan.strategy, stageWorkers, stageStatus)
+        });
+      };
+
+      logMessage(
+        "path stage " + stageName + " start: " + String(list.length) + " blocks, " +
+        String(stageBots.length) + " bots, strategy=" + splitPlan.strategy,
+        "System"
+      );
+      publishProgress(true);
+
+      for (let index = 0; index < stageBots.length; index += 1) {
+        const workerBot = stageBots[index];
+        const chunk = chunks[index];
+        if (!chunk || chunk.length === 0) {
+          continue;
+        }
+
+        await teleportWorkerNearChunk(workerBot, stageWorkers[index].bounds, stageTargets[stageName] || workerFallbackTarget);
+        await runBotCommand(bot, "/clear " + workerBot.username);
+        await ensurePlacementInventory(workerBot, chunk, null, {
+          commandBot: bot
+        });
+      }
+
+      const stageResults = await Promise.all(stageBots.map((workerBot, index) => placeStageChunk(
+        workerBot,
+        chunks[index] || [],
+        stageName,
+        stageRange,
+        stageStatus,
+        stageWorkers[index],
+        publishProgress,
+        () => stopRequested
+      ).then((ok) => {
+        if (!ok && !continueOnError) {
+          stopRequested = true;
+        }
+        return ok;
+      })));
+      publishProgress(true);
+
+      const target = stageTargets[stageName];
+      if (target) {
+        try {
+          await ensureNear(bot, target.x, target.y, target.z, 1);
+        } catch (error) {
+          await runBotCommand(bot, "/tp " + bot.username + " " + String(target.x) + " " + String(target.y) + " " + String(target.z));
+        }
+      }
+
+      if (!continueOnError && stageResults.some((entry) => !entry)) {
+        return false;
+      }
+      return true;
+    }
+
+    try {
+      updateBuildProgress("connecting worker bots", {
+        stage: {
+          name: "setup",
+          requestedWorkers,
+          connectedWorkers: workerBots.map((entry) => entry.username)
+        }
+      });
+
+      for (let helperIndex = 1; helperIndex < requestedWorkers; helperIndex += 1) {
+        const helperName = (helperPrefix + String(helperIndex)).slice(0, 16);
+        if (helperName === bot.username) {
+          continue;
+        }
+
+        try {
+          const helperBot = await connectAuxiliaryBot(connectOptions, helperName);
+          helperBots.push(helperBot);
+          workerBots.push(helperBot);
+          await runBotCommand(bot, "/gamemode creative " + helperName);
+          await teleportWorkerNearChunk(helperBot, null, workerFallbackTarget);
+        } catch (error) {
+          logMessage("failed to connect aux bot " + helperName + ": " + (error && error.message ? error.message : String(error)), "Error");
+        }
+      }
+
+      for (const stageName of stageOrder) {
+        const ok = await placeStage(stageName);
+        if (!ok) {
+          return {
+            ok: false,
+            action: "build_reference_path_chain",
+            origin: {
+              x: originX,
+              y: originY,
+              z: originZ
+            },
+            workers: workerBots.map((entry) => entry.username),
+            workerMode,
+            placedCount,
+            failureCount,
+            results
+          };
+        }
+      }
+
+      return {
+        ok: true,
+        action: "build_reference_path_chain",
+        origin: {
+          x: originX,
+          y: originY,
+          z: originZ
+        },
+        workers: workerBots.map((entry) => entry.username),
+        workerMode,
+        path: {
+          segmentCount,
+          segmentLength,
+          pathWidth,
+          totalLength: pathPlan.totalLength
+        },
+        placedCount,
+        failureCount,
+        results
+      };
+    } finally {
+      await disconnectAuxiliaryBots(helperBots);
+    }
+  });
+}
+
 async function farmStoreFive(body) {
   return actionManager.run("farm_store_five", async (manager) => {
     const bot = requireBot();
@@ -3991,6 +4774,11 @@ async function runAction(body) {
     case "build_two_story_house":
     case "build-two-story-house":
       return buildDecoratedTwoStoryHouse(body);
+    case "build_reference_path_chain":
+    case "build-reference-path-chain":
+    case "build_path_chain":
+    case "build-path-chain":
+      return buildReferencePathChain(body);
     case "farm_store_five":
     case "farm-store-five":
       return farmStoreFive(body);
