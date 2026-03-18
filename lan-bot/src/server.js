@@ -1451,19 +1451,27 @@ async function farmStoreFive(body) {
     const hoeItem = stringValue(body, "hoeItem", "diamond_hoe");
     const boneMealItem = stringValue(body, "boneMealItem", "bone_meal");
     const waterItem = stringValue(body, "waterItem", "water_bucket");
+    const groundItem = stringValue(body, "groundItem", "dirt");
+    const prepareGround = boolValue(body, "prepareGround", true);
     const width = 5;
     const depth = 5;
     const cropY = supportY + 1;
     const centerX = originX + 2;
     const centerZ = originZ + 2;
+    const chestAX = originX + width + 2;
+    const chestAZ = originZ + 2;
+    const chestAY = cropY;
     const cropPositions = [];
     const results = {
+      supportPlaced: 0,
       tilled: 0,
       planted: 0,
       matured: 0,
       harvested: 0,
       wheatCount: 0,
+      waterPlaced: false,
       chestPlaced: false,
+      chestMerged: false,
       patternPlaced: false
     };
 
@@ -1475,6 +1483,9 @@ async function farmStoreFive(body) {
     await ensureInventoryItem(bot, boneMealItem, 64);
     await ensureInventoryItem(bot, chestItem, 2);
     await ensureInventoryItem(bot, waterItem, 1);
+    if (prepareGround) {
+      await ensureInventoryItem(bot, groundItem, width * depth + 2);
+    }
 
     for (let dz = 0; dz < depth; dz += 1) {
       for (let dx = 0; dx < width; dx += 1) {
@@ -1487,12 +1498,40 @@ async function farmStoreFive(body) {
       }
     }
 
+    if (prepareGround) {
+      const supportTargets = [];
+      for (let dz = 0; dz < depth; dz += 1) {
+        for (let dx = 0; dx < width; dx += 1) {
+          supportTargets.push({ x: originX + dx, y: supportY, z: originZ + dz });
+        }
+      }
+      supportTargets.push({ x: chestAX, y: supportY, z: chestAZ });
+      supportTargets.push({ x: chestAX + 1, y: supportY, z: chestAZ });
+
+      for (const supportTarget of supportTargets) {
+        const supportResult = await ensureSupportBlockByHand(
+          bot,
+          supportTarget.x,
+          supportTarget.y,
+          supportTarget.z,
+          groundItem,
+          range,
+          useDelayMs
+        );
+        if (supportResult.placed) {
+          results.supportPlaced += 1;
+        }
+      }
+    }
+
     const centerSupport = bot.blockAt(new Vec3(centerX, supportY, centerZ));
     if (!centerSupport || isAir(centerSupport)) {
       throw new Error("farm center support missing at " + blockKey(centerX, supportY, centerZ));
     }
 
-    await rightClickBlockWithItem(bot, waterItem, centerX, supportY, centerZ, range, useDelayMs);
+    await clearBlockIfNeeded(bot, centerX, cropY, centerZ, range, useDelayMs);
+    await placeWaterSourceByHand(bot, waterItem, centerX, cropY, centerZ, range, useDelayMs);
+    results.waterPlaced = true;
 
     for (const position of cropPositions) {
       if (manager.isCancelled()) {
@@ -1515,6 +1554,10 @@ async function farmStoreFive(body) {
       results.tilled += 1;
 
       let cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+      if (cropBlock && !isAir(cropBlock) && cropBlock.name !== cropItem) {
+        await clearBlockIfNeeded(bot, position.x, cropY, position.z, range, useDelayMs);
+        cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
+      }
       if (isAir(cropBlock)) {
         await rightClickBlockWithItem(bot, seedItem, position.x, supportY, position.z, range, useDelayMs);
         cropBlock = bot.blockAt(new Vec3(position.x, cropY, position.z));
@@ -1568,20 +1611,16 @@ async function farmStoreFive(body) {
       throw new Error("not enough harvested wheat to form 5, count=" + String(results.wheatCount));
     }
 
-    const chestAX = originX + width + 2;
-    const chestAZ = originZ + 2;
-    const chestAY = cropY;
-    await placeBlockByHand(bot, { x: chestAX, y: chestAY, z: chestAZ, item: chestItem }, {
-      range,
-      placeDelayMs: useDelayMs,
-      replace: false
-    });
-    await placeBlockByHand(bot, { x: chestAX + 1, y: chestAY, z: chestAZ, item: chestItem }, {
-      range,
-      placeDelayMs: useDelayMs,
-      replace: false
-    });
+    await clearBlockIfNeeded(bot, chestAX, chestAY, chestAZ, range, useDelayMs);
+    await clearBlockIfNeeded(bot, chestAX + 1, chestAY, chestAZ, range, useDelayMs);
+    await placeDoubleChestByHand(
+      bot,
+      { x: chestAX, y: chestAY, z: chestAZ, item: chestItem },
+      { x: chestAX + 1, y: chestAY, z: chestAZ, item: chestItem },
+      { range, placeDelayMs: useDelayMs }
+    );
     results.chestPlaced = true;
+    results.chestMerged = true;
 
     await ensureNear(bot, chestAX, chestAY, chestAZ, range);
     const chestBlock = bot.blockAt(new Vec3(chestAX, chestAY, chestAZ));
@@ -1591,6 +1630,9 @@ async function farmStoreFive(body) {
 
     const container = await bot.openContainer(chestBlock);
     try {
+      if (container.inventoryStart < 54) {
+        throw new Error("double chest did not open as merged container");
+      }
       const patternSlots = buildFivePatternSlots();
       const remainderSlot = firstEmptyContainerSlot(container, Math.max(...patternSlots) + 1);
       await arrangeItemsInChest(container, bot, cropItem, patternSlots, remainderSlot);
