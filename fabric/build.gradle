@@ -1,0 +1,33 @@
+plugins {
+    id 'fabric-loom' version '1.9-SNAPSHOT'
+}
+
+group = rootProject.maven_group
+version = rootProject.mod_version
+
+dependencies {
+    minecraft "com.mojang:minecraft:${rootProject.minecraft_version}"
+    mappings "net.fabricmc:yarn:${rootProject.minecraft_version}+build.1:v2"
+    modImplementation "net.fabricmc:fabric-loader:${rootProject.fabric_loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${rootProject.fabric_api_version}"
+    
+    implementation project(':common')
+}
+
+processResources {
+    def expandProps = [
+            "version": version,
+            "group": rootProject.maven_group,
+            "minecraft_version": rootProject.minecraft_version,
+            "fabric_loader_version": rootProject.fabric_loader_version,
+            "fabric_api_version": rootProject.fabric_api_version,
+            "mod_id": rootProject.mod_id
+    ]
+    filesMatching('fabric.mod.json') {
+        expand expandProps
+    }
+}
+
+remapJar {
+    archiveBaseName.set("${rootProject.archives_base_name}-fabric")
+}

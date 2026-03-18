@@ -1,0 +1,54 @@
+plugins {
+    id 'java'
+}
+
+allprojects {
+    apply plugin: 'java'
+
+    group = project.maven_group
+    version = project.mod_version
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+        withSourcesJar()
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+        options.release = 21
+    }
+}
+
+subprojects {
+    archivesBaseName = "${project.archives_base_name}-${project.name}"
+
+    // Only include LICENSE in final mod jars, not in common module
+    if (project.name != 'common') {
+        jar {
+            from(rootProject.file("LICENSE")) {
+                rename { "${it}_${project.archivesBaseName}" }
+            }
+        }
+
+        processResources {
+            def expandProps = [
+                    "version": version,
+                    "group": project.maven_group,
+                    "minecraft_version": project.minecraft_version,
+                    "mod_id": project.mod_id
+            ]
+            // Add loader-specific properties
+            if (project.hasProperty('fabric_loader_version')) {
+                expandProps["fabric_loader_version"] = project.fabric_loader_version
+            }
+            if (project.hasProperty('fabric_api_version')) {
+                expandProps["fabric_api_version"] = project.fabric_api_version
+            }
+            filesMatching(['fabric.mod.json', 'META-INF/neoforge.mods.toml', '*.mixins.json']) {
+                expand expandProps
+            }
+        }
+    }
+}

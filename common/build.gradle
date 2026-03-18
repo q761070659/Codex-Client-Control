@@ -1,0 +1,35 @@
+plugins {
+    id 'java'
+}
+
+group = rootProject.maven_group
+version = rootProject.mod_version
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+dependencies {
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.slf4j:slf4j-api:2.0.9'
+}
+
+processResources {
+    def expandProps = [
+            "version": version,
+            "group": project.maven_group,
+            "minecraft_version": rootProject.minecraft_version,
+            "mod_id": rootProject.mod_id
+    ]
+    filesMatching('**/*.json') {
+        expand expandProps
+    }
+}
