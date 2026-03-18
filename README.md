@@ -482,3 +482,8 @@ HTTP 状态码：
 - Fabric Loader 0.18.4+ / Fabric API 0.127.0+1.21.11
 - NeoForge 21.11.38-beta
 - Java 21
+
+
+## 引用说明：
+引用的是发表于论文的《Collaborating Action by Action: A Multi-agent LLM Framework for Embodied Reasoning》
+https://arxiv.org/abs/2504.17950
