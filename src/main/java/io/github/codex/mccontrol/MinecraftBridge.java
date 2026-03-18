@@ -369,59 +369,16 @@ public final class MinecraftBridge {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object player = minecraftPlayerField.get(minecraft);
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("ok", Boolean.TRUE);
-            payload.put("screen", screenSummary(minecraftScreenField.get(minecraft)));
-            payload.put("inWorld", player != null);
-
-            if (player != null) {
-                Object foodData = playerGetFoodDataMethod.invoke(player);
-                Object inventory = playerInventoryField.get(player);
-
-                payload.put("x", invokeDouble(entityGetXMethod, player));
-                payload.put("y", invokeDouble(entityGetYMethod, player));
-                payload.put("z", invokeDouble(entityGetZMethod, player));
-                payload.put("yaw", invokeFloat(entityGetYawMethod, player));
-                payload.put("pitch", invokeFloat(entityGetPitchMethod, player));
-                payload.put("health", invokeFloat(livingGetHealthMethod, player));
-                payload.put("maxHealth", invokeFloat(livingGetMaxHealthMethod, player));
-                payload.put("food", invokeInt(foodDataGetFoodLevelMethod, foodData));
-                payload.put("saturation", invokeFloat(foodDataGetSaturationMethod, foodData));
-                payload.put("selectedHotbarSlot", invokeInt(inventoryGetSelectedSlotMethod, inventory) + 1);
-            }
-
-            return payload;
+            return statusPayload(minecraft, player);
         });
     }
 
     public Map<String, Object> getChat(long sinceExclusive, int limit) throws ReflectiveOperationException {
+        long safeSinceExclusive = Math.max(-1L, sinceExclusive);
+        int safeLimit = Math.max(1, limit);
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
-            Object gui = minecraftGuiField.get(minecraft);
-            Object chat = guiGetChatMethod.invoke(gui);
-
-            List<?> rawMessages = (List<?>) chatAllMessagesField.get(chat);
-            List<ChatHistory.ChatMessageSnapshot> currentMessages = new ArrayList<>();
-            for (Object rawMessage : rawMessages) {
-                int addedTime = ((Number) guiMessageAddedTimeField.get(rawMessage)).intValue();
-                Object content = guiMessageContentField.get(rawMessage);
-                Object tag = guiMessageTagField.get(rawMessage);
-                currentMessages.add(new ChatHistory.ChatMessageSnapshot(
-                    addedTime,
-                    componentToString(content),
-                    tagToString(tag)
-                ));
-            }
-
-            chatHistory.record(currentMessages);
-
-            List<String> recentTyped = new ArrayList<>();
-            @SuppressWarnings("unchecked")
-            Deque<String> recent = (Deque<String>) chatRecentMessagesField.get(chat);
-            recentTyped.addAll(recent);
-
-            return chatHistory.snapshot(Math.max(-1L, sinceExclusive), Math.max(1, limit), recentTyped);
+            return chatPayload(minecraft, safeSinceExclusive, safeLimit);
         });
     }
 
@@ -439,31 +396,9 @@ public final class MinecraftBridge {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object player = minecraftPlayerField.get(minecraft);
+            Object screen = minecraftScreenField.get(minecraft);
             Object hitResult = minecraftHitResultField.get(minecraft);
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("ok", Boolean.TRUE);
-            payload.put("inWorld", player != null);
-            payload.put("screen", screenSummary(minecraftScreenField.get(minecraft)));
-
-            if (hitResult == null) {
-                payload.put("type", "NONE");
-                payload.put("hit", Boolean.FALSE);
-                return payload;
-            }
-
-            String type = String.valueOf(hitResultGetTypeMethod.invoke(hitResult));
-            payload.put("type", type);
-            payload.put("hit", !"MISS".equalsIgnoreCase(type));
-            payload.put("location", vec3ToMap(hitResultGetLocationMethod.invoke(hitResult)));
-
-            if (blockHitResultClass.isInstance(hitResult)) {
-                payload.put("block", blockHitSummary(hitResult));
-            } else if (entityHitResultClass.isInstance(hitResult)) {
-                payload.put("entity", entitySummary(entityHitResultGetEntityMethod.invoke(hitResult)));
-            }
-
-            return payload;
+            return crosshairTargetPayload(minecraft, player, screen, hitResult);
         });
     }
 
@@ -471,48 +406,7 @@ public final class MinecraftBridge {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object screen = minecraftScreenField.get(minecraft);
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("ok", Boolean.TRUE);
-            payload.put("screen", screenSummary(screen));
-
-            if (screen == null || !abstractContainerScreenClass.isInstance(screen)) {
-                payload.put("containerOpen", Boolean.FALSE);
-                payload.put("slotCount", 0);
-                payload.put("slots", List.of());
-                payload.put("carried", itemStackSummary(null));
-                return payload;
-            }
-
-            Object menu = abstractContainerScreenMenuField.get(screen);
-            Object hoveredSlot = abstractContainerScreenHoveredSlotField.get(screen);
-            @SuppressWarnings("unchecked")
-            List<Object> slots = (List<Object>) abstractContainerMenuSlotsField.get(menu);
-
-            List<Map<String, Object>> slotPayloads = new ArrayList<>();
-            for (int index = 0; index < slots.size(); index++) {
-                Object slot = slots.get(index);
-                Map<String, Object> slotPayload = new LinkedHashMap<>();
-                slotPayload.put("index", index);
-                slotPayload.put("containerSlot", invokeInt(slotGetContainerSlotMethod, slot));
-                slotPayload.put("x", ((Number) slotXField.get(slot)).intValue());
-                slotPayload.put("y", ((Number) slotYField.get(slot)).intValue());
-                slotPayload.put("active", slotIsActiveMethod.invoke(slot));
-                slotPayload.put("fake", slotIsFakeMethod.invoke(slot));
-                slotPayload.put("hovered", slot == hoveredSlot);
-                slotPayload.put("hasItem", slotHasItemMethod.invoke(slot));
-                slotPayload.put("item", itemStackSummary(slotGetItemMethod.invoke(slot)));
-                slotPayloads.add(slotPayload);
-            }
-
-            payload.put("containerOpen", Boolean.TRUE);
-            payload.put("className", screen.getClass().getName());
-            payload.put("leftPos", ((Number) abstractContainerScreenLeftPosField.get(screen)).intValue());
-            payload.put("topPos", ((Number) abstractContainerScreenTopPosField.get(screen)).intValue());
-            payload.put("slotCount", slotPayloads.size());
-            payload.put("slots", slotPayloads);
-            payload.put("carried", itemStackSummary(menuGetCarriedMethod.invoke(menu)));
-            return payload;
+            return containerContentsPayload(screen);
         });
     }
 
@@ -520,31 +414,176 @@ public final class MinecraftBridge {
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object player = minecraftPlayerField.get(minecraft);
+            return playerListPayload(player);
+        });
+    }
+
+    public Map<String, Object> getFullState(int chatLimit) throws ReflectiveOperationException {
+        int safeChatLimit = Math.max(1, chatLimit);
+        return onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object player = minecraftPlayerField.get(minecraft);
+            Object screen = minecraftScreenField.get(minecraft);
+            Object hitResult = minecraftHitResultField.get(minecraft);
 
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("ok", Boolean.TRUE);
-            payload.put("inWorld", player != null);
-
-            if (player == null) {
-                payload.put("count", 0);
-                payload.put("players", List.of());
-                return payload;
-            }
-
-            Object connection = localPlayerConnectionField.get(player);
-            @SuppressWarnings("unchecked")
-            Collection<Object> rawPlayers = (Collection<Object>) packetListenerGetListedOnlinePlayersMethod.invoke(connection);
-
-            List<Map<String, Object>> players = new ArrayList<>();
-            for (Object rawPlayer : rawPlayers) {
-                players.add(playerInfoSummary(rawPlayer));
-            }
-
-            players.sort(Comparator.comparing(entry -> String.valueOf(entry.get("name")), String.CASE_INSENSITIVE_ORDER));
-            payload.put("count", players.size());
-            payload.put("players", players);
+            payload.put("status", statusPayload(minecraft, player));
+            payload.put("screen", screenSnapshot(screen, true));
+            payload.put("target", crosshairTargetPayload(minecraft, player, screen, hitResult));
+            payload.put("container", containerContentsPayload(screen));
+            payload.put("players", playerListPayload(player));
+            payload.put("chat", chatPayload(minecraft, -1L, safeChatLimit));
             return payload;
         });
+    }
+
+    private Map<String, Object> statusPayload(Object minecraft, Object player) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("screen", screenSummary(minecraftScreenField.get(minecraft)));
+        payload.put("inWorld", player != null);
+
+        if (player != null) {
+            Object foodData = playerGetFoodDataMethod.invoke(player);
+            Object inventory = playerInventoryField.get(player);
+
+            payload.put("x", invokeDouble(entityGetXMethod, player));
+            payload.put("y", invokeDouble(entityGetYMethod, player));
+            payload.put("z", invokeDouble(entityGetZMethod, player));
+            payload.put("yaw", invokeFloat(entityGetYawMethod, player));
+            payload.put("pitch", invokeFloat(entityGetPitchMethod, player));
+            payload.put("health", invokeFloat(livingGetHealthMethod, player));
+            payload.put("maxHealth", invokeFloat(livingGetMaxHealthMethod, player));
+            payload.put("food", invokeInt(foodDataGetFoodLevelMethod, foodData));
+            payload.put("saturation", invokeFloat(foodDataGetSaturationMethod, foodData));
+            payload.put("selectedHotbarSlot", invokeInt(inventoryGetSelectedSlotMethod, inventory) + 1);
+        }
+
+        return payload;
+    }
+
+    private Map<String, Object> chatPayload(Object minecraft, long sinceExclusive, int limit) throws ReflectiveOperationException {
+        Object gui = minecraftGuiField.get(minecraft);
+        Object chat = guiGetChatMethod.invoke(gui);
+
+        List<?> rawMessages = (List<?>) chatAllMessagesField.get(chat);
+        List<ChatHistory.ChatMessageSnapshot> currentMessages = new ArrayList<>();
+        for (Object rawMessage : rawMessages) {
+            int addedTime = ((Number) guiMessageAddedTimeField.get(rawMessage)).intValue();
+            Object content = guiMessageContentField.get(rawMessage);
+            Object tag = guiMessageTagField.get(rawMessage);
+            currentMessages.add(new ChatHistory.ChatMessageSnapshot(
+                addedTime,
+                componentToString(content),
+                tagToString(tag)
+            ));
+        }
+
+        chatHistory.record(currentMessages);
+
+        List<String> recentTyped = new ArrayList<>();
+        @SuppressWarnings("unchecked")
+        Deque<String> recent = (Deque<String>) chatRecentMessagesField.get(chat);
+        recentTyped.addAll(recent);
+
+        return chatHistory.snapshot(sinceExclusive, limit, recentTyped);
+    }
+
+    private Map<String, Object> crosshairTargetPayload(Object minecraft, Object player, Object screen, Object hitResult) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("inWorld", player != null);
+        payload.put("screen", screenSummary(screen));
+
+        if (hitResult == null) {
+            payload.put("type", "NONE");
+            payload.put("hit", Boolean.FALSE);
+            return payload;
+        }
+
+        String type = String.valueOf(hitResultGetTypeMethod.invoke(hitResult));
+        payload.put("type", type);
+        payload.put("hit", !"MISS".equalsIgnoreCase(type));
+        payload.put("location", vec3ToMap(hitResultGetLocationMethod.invoke(hitResult)));
+
+        if (blockHitResultClass.isInstance(hitResult)) {
+            payload.put("block", blockHitSummary(hitResult));
+        } else if (entityHitResultClass.isInstance(hitResult)) {
+            payload.put("entity", entitySummary(entityHitResultGetEntityMethod.invoke(hitResult)));
+        }
+
+        return payload;
+    }
+
+    private Map<String, Object> containerContentsPayload(Object screen) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("screen", screenSummary(screen));
+
+        if (screen == null || !abstractContainerScreenClass.isInstance(screen)) {
+            payload.put("containerOpen", Boolean.FALSE);
+            payload.put("slotCount", 0);
+            payload.put("slots", List.of());
+            payload.put("carried", itemStackSummary(null));
+            return payload;
+        }
+
+        Object menu = abstractContainerScreenMenuField.get(screen);
+        Object hoveredSlot = abstractContainerScreenHoveredSlotField.get(screen);
+        @SuppressWarnings("unchecked")
+        List<Object> slots = (List<Object>) abstractContainerMenuSlotsField.get(menu);
+
+        List<Map<String, Object>> slotPayloads = new ArrayList<>();
+        for (int index = 0; index < slots.size(); index++) {
+            Object slot = slots.get(index);
+            Map<String, Object> slotPayload = new LinkedHashMap<>();
+            slotPayload.put("index", index);
+            slotPayload.put("containerSlot", invokeInt(slotGetContainerSlotMethod, slot));
+            slotPayload.put("x", ((Number) slotXField.get(slot)).intValue());
+            slotPayload.put("y", ((Number) slotYField.get(slot)).intValue());
+            slotPayload.put("active", slotIsActiveMethod.invoke(slot));
+            slotPayload.put("fake", slotIsFakeMethod.invoke(slot));
+            slotPayload.put("hovered", slot == hoveredSlot);
+            slotPayload.put("hasItem", slotHasItemMethod.invoke(slot));
+            slotPayload.put("item", itemStackSummary(slotGetItemMethod.invoke(slot)));
+            slotPayloads.add(slotPayload);
+        }
+
+        payload.put("containerOpen", Boolean.TRUE);
+        payload.put("className", screen.getClass().getName());
+        payload.put("leftPos", ((Number) abstractContainerScreenLeftPosField.get(screen)).intValue());
+        payload.put("topPos", ((Number) abstractContainerScreenTopPosField.get(screen)).intValue());
+        payload.put("slotCount", slotPayloads.size());
+        payload.put("slots", slotPayloads);
+        payload.put("carried", itemStackSummary(menuGetCarriedMethod.invoke(menu)));
+        return payload;
+    }
+
+    private Map<String, Object> playerListPayload(Object player) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("inWorld", player != null);
+
+        if (player == null) {
+            payload.put("count", 0);
+            payload.put("players", List.of());
+            return payload;
+        }
+
+        Object connection = localPlayerConnectionField.get(player);
+        @SuppressWarnings("unchecked")
+        Collection<Object> rawPlayers = (Collection<Object>) packetListenerGetListedOnlinePlayersMethod.invoke(connection);
+
+        List<Map<String, Object>> players = new ArrayList<>();
+        for (Object rawPlayer : rawPlayers) {
+            players.add(playerInfoSummary(rawPlayer));
+        }
+
+        players.sort(Comparator.comparing(entry -> String.valueOf(entry.get("name")), String.CASE_INSENSITIVE_ORDER));
+        payload.put("count", players.size());
+        payload.put("players", players);
+        return payload;
     }
 
     public Map<String, Object> takeScreenshot(String requestedName) throws ReflectiveOperationException {
@@ -917,56 +956,40 @@ public final class MinecraftBridge {
             throw new IllegalArgumentException("slot must be between 1 and 9");
         }
 
-        Map<String, Boolean> normalizedKeyStates = new LinkedHashMap<>();
-        if (keyStates != null) {
-            for (Map.Entry<String, Boolean> entry : keyStates.entrySet()) {
-                if (entry.getKey() == null || entry.getKey().isBlank() || entry.getValue() == null) {
-                    continue;
-                }
-                normalizedKeyStates.put(entry.getKey(), entry.getValue());
-            }
-        }
+        Map<String, Boolean> normalizedKeyStates = normalizeControlKeys(keyStates);
 
         return onClientThread(() -> {
             Object minecraft = getMinecraft();
             Object player = requirePlayer();
             Object options = minecraftOptionsField.get(minecraft);
 
-            if (clearMovement) {
-                for (String key : MOVEMENT_KEYS) {
-                    applyKeyState(options, key, false);
-                }
-            }
-
-            for (Map.Entry<String, Boolean> entry : normalizedKeyStates.entrySet()) {
-                applyKeyState(options, entry.getKey(), entry.getValue());
-            }
-
-            Float appliedYaw = null;
-            Float appliedPitch = null;
-            if (yaw != null || pitch != null || deltaYaw != null || deltaPitch != null) {
-                float[] look = applyLook(player, yaw, pitch, deltaYaw, deltaPitch);
-                appliedYaw = look[0];
-                appliedPitch = look[1];
-            }
-
-            if (hotbarSlot != null) {
-                applyHotbarSlot(minecraft, player, hotbarSlot - 1);
-            }
-
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("ok", Boolean.TRUE);
-            payload.put("movementCleared", clearMovement);
-            payload.put("keysApplied", new ArrayList<>(normalizedKeyStates.keySet()));
-            if (hotbarSlot != null) {
-                payload.put("hotbarSlot", hotbarSlot);
-            }
-            if (appliedYaw != null && appliedPitch != null) {
-                payload.put("yaw", appliedYaw);
-                payload.put("pitch", appliedPitch);
-            }
-            return payload;
+            return applyControlStateNow(minecraft, player, options, normalizedKeyStates, clearMovement, yaw, pitch, deltaYaw, deltaPitch, hotbarSlot);
         });
+    }
+
+    public void submitControlState(
+        Map<String, Boolean> keyStates,
+        boolean clearMovement,
+        Float yaw,
+        Float pitch,
+        Float deltaYaw,
+        Float deltaPitch,
+        Integer hotbarSlot,
+        Consumer<Throwable> errorHandler
+    ) throws ReflectiveOperationException {
+        if (hotbarSlot != null && (hotbarSlot < 1 || hotbarSlot > 9)) {
+            throw new IllegalArgumentException("slot must be between 1 and 9");
+        }
+
+        Map<String, Boolean> normalizedKeyStates = normalizeControlKeys(keyStates);
+        Consumer<Throwable> sink = errorHandler != null ? errorHandler : ignored -> { };
+        onClientThreadAsync(() -> {
+            Object minecraft = getMinecraft();
+            Object player = requirePlayer();
+            Object options = minecraftOptionsField.get(minecraft);
+            applyControlStateNow(minecraft, player, options, normalizedKeyStates, clearMovement, yaw, pitch, deltaYaw, deltaPitch, hotbarSlot);
+            return null;
+        }, sink);
     }
 
     private Map<String, Object> screenSummary(Object screen) throws ReflectiveOperationException {
@@ -1268,6 +1291,68 @@ public final class MinecraftBridge {
         }
     }
 
+    private Map<String, Boolean> normalizeControlKeys(Map<String, Boolean> keyStates) {
+        Map<String, Boolean> normalizedKeyStates = new LinkedHashMap<>();
+        if (keyStates == null) {
+            return normalizedKeyStates;
+        }
+        for (Map.Entry<String, Boolean> entry : keyStates.entrySet()) {
+            if (entry.getKey() == null || entry.getKey().isBlank() || entry.getValue() == null) {
+                continue;
+            }
+            normalizedKeyStates.put(entry.getKey(), entry.getValue());
+        }
+        return normalizedKeyStates;
+    }
+
+    private Map<String, Object> applyControlStateNow(
+        Object minecraft,
+        Object player,
+        Object options,
+        Map<String, Boolean> normalizedKeyStates,
+        boolean clearMovement,
+        Float yaw,
+        Float pitch,
+        Float deltaYaw,
+        Float deltaPitch,
+        Integer hotbarSlot
+    ) throws ReflectiveOperationException {
+        if (clearMovement) {
+            for (String key : MOVEMENT_KEYS) {
+                applyKeyState(options, key, false);
+            }
+        }
+
+        for (Map.Entry<String, Boolean> entry : normalizedKeyStates.entrySet()) {
+            applyKeyState(options, entry.getKey(), entry.getValue());
+        }
+
+        Float appliedYaw = null;
+        Float appliedPitch = null;
+        if (yaw != null || pitch != null || deltaYaw != null || deltaPitch != null) {
+            float[] look = applyLook(player, yaw, pitch, deltaYaw, deltaPitch);
+            appliedYaw = look[0];
+            appliedPitch = look[1];
+        }
+
+        if (hotbarSlot != null) {
+            applyHotbarSlot(minecraft, player, hotbarSlot - 1);
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("movementCleared", clearMovement);
+        payload.put("keysApplied", new ArrayList<>(normalizedKeyStates.keySet()));
+        if (hotbarSlot != null) {
+            payload.put("hotbarSlot", hotbarSlot);
+        }
+        if (appliedYaw != null && appliedPitch != null) {
+            payload.put("yaw", appliedYaw);
+            payload.put("pitch", appliedPitch);
+        }
+        return payload;
+    }
+
     private Object resolveKeyMapping(Object options, String keyName) throws ReflectiveOperationException {
         Field field = findFieldAny(optionsClass, optionKeyFieldNames(keyName));
         return field.get(options);
@@ -1319,6 +1404,21 @@ public final class MinecraftBridge {
             }
             throw new IllegalStateException("client task failed", cause);
         }
+    }
+
+    private void onClientThreadAsync(ReflectiveCallable<?> callable, Consumer<Throwable> errorHandler) throws ReflectiveOperationException {
+        Object minecraft = getMinecraft();
+        if (!(minecraft instanceof Executor executor)) {
+            throw new IllegalStateException("minecraft is not an executor");
+        }
+
+        executor.execute(() -> {
+            try {
+                callable.call();
+            } catch (Throwable throwable) {
+                errorHandler.accept(throwable);
+            }
+        });
     }
 
     private static String normalizeMessage(String value, String label) {

@@ -1,0 +1,17 @@
+{
+  "name": "codex-lan-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fast LAN bot service for Codex Client Control",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "minecraft-protocol": "^1.62.0",
+    "mineflayer": "^4.33.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10"
+  }
+}
