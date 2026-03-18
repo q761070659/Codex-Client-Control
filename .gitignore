@@ -1,7 +1,5 @@
 .gradle/
-**/.gradle/
 build/
-**/build/
 
 .idea/
 .vscode/
@@ -10,18 +8,3 @@ build/
 *.iws
 
 neoforge/runs/
-
-node_modules/
-lan-bot/node_modules/
-
-*.log
-*.out
-*.err
-*.pid
-hs_err_pid*
-replay_pid*
-
-lan-bot/run-build-*.ps1
-
-.DS_Store
-Thumbs.db
