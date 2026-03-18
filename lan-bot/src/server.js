@@ -450,6 +450,46 @@ function getPlayersPayload() {
   };
 }
 
+function getBlockPayload(x, y, z) {
+  if (!state.bot || !state.connected || !state.spawned) {
+    return {
+      ok: true,
+      connected: false,
+      block: null
+    };
+  }
+
+  const block = state.bot.blockAt(new Vec3(x, y, z));
+  if (!block) {
+    return {
+      ok: true,
+      connected: true,
+      block: null
+    };
+  }
+
+  let properties = {};
+  if (typeof block.getProperties === "function") {
+    properties = block.getProperties() || {};
+  }
+
+  return {
+    ok: true,
+    connected: true,
+    block: {
+      x,
+      y,
+      z,
+      name: block.name,
+      displayName: block.displayName || block.name,
+      stateId: block.stateId,
+      type: block.type,
+      isAir: isAir(block),
+      properties
+    }
+  };
+}
+
 function getStatusPayload() {
   const payload = {
     ok: true,
@@ -565,6 +605,34 @@ function registryItemName(itemName) {
   return String(itemName || "").toLowerCase().replace(/^minecraft:/, "");
 }
 
+function deriveRelatedItemName(itemName, variant) {
+  const raw = String(itemName || "").trim();
+  if (!raw) {
+    return variant;
+  }
+
+  const separatorIndex = raw.indexOf(":");
+  const namespace = separatorIndex >= 0 ? raw.slice(0, separatorIndex) : "";
+  const baseName = separatorIndex >= 0 ? raw.slice(separatorIndex + 1) : raw;
+  const normalizedBase = baseName.toLowerCase();
+
+  if (normalizedBase.endsWith("_" + variant)) {
+    return raw;
+  }
+
+  let stem = normalizedBase;
+  if (stem.endsWith("_planks")) {
+    stem = stem.slice(0, -"_planks".length);
+  }
+
+  const derivedName = stem + "_" + variant;
+  return namespace ? namespace + ":" + derivedName : derivedName;
+}
+
+function isItemVariant(itemName, variant) {
+  return registryItemName(itemName).endsWith("_" + variant);
+}
+
 function getItemStackSize(bot, itemName) {
   const normalized = registryItemName(itemName);
   const registryItem = bot.registry &&
@@ -663,20 +731,52 @@ async function ensureInventoryItem(bot, itemName, minimumCount) {
   throw new Error("failed to obtain item: " + itemName);
 }
 
-function getPlacementSupport(bot, x, y, z, preferredSupport) {
-  if (preferredSupport &&
-    preferredSupport.position &&
-    preferredSupport.face &&
-    preferredSupport.position.x + preferredSupport.face.x === x &&
-    preferredSupport.position.y + preferredSupport.face.y === y &&
-    preferredSupport.position.z + preferredSupport.face.z === z) {
-    const preferredBlock = bot.blockAt(preferredSupport.position);
-    if (!isAir(preferredBlock)) {
-      return {
-        block: preferredBlock,
-        face: preferredSupport.face
-      };
+function getPlacementSupportCandidates(bot, x, y, z, preferredSupport) {
+  const ordered = [];
+  const deferred = [];
+  const seen = new Set();
+
+  function addCandidate(position, face) {
+    if (!position || !face) {
+      return;
     }
+
+    if (position.x + face.x !== x ||
+      position.y + face.y !== y ||
+      position.z + face.z !== z) {
+      return;
+    }
+
+    const key = blockKey(position.x, position.y, position.z) + "|" + blockKey(face.x, face.y, face.z);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+
+    const block = bot.blockAt(position);
+    if (isAir(block)) {
+      return;
+    }
+
+    const interactive = block.name.endsWith("_door") ||
+      block.name === "chest" ||
+      block.name === "trapped_chest" ||
+      block.name.endsWith("_fence_gate");
+
+    const entry = {
+      block,
+      face
+    };
+    if (interactive) {
+      deferred.push(entry);
+      return;
+    }
+
+    ordered.push(entry);
+  }
+
+  if (preferredSupport && preferredSupport.position && preferredSupport.face) {
+    addCandidate(preferredSupport.position, preferredSupport.face);
   }
 
   const candidates = [
@@ -689,16 +789,98 @@ function getPlacementSupport(bot, x, y, z, preferredSupport) {
   ];
 
   for (const candidate of candidates) {
-    const block = bot.blockAt(candidate.support);
-    if (!isAir(block)) {
-      return {
-        block,
-        face: candidate.face
-      };
-    }
+    addCandidate(candidate.support, candidate.face);
   }
 
-  return null;
+  return ordered.concat(deferred);
+}
+
+function getPlacementSupport(bot, x, y, z, preferredSupport) {
+  const candidates = getPlacementSupportCandidates(bot, x, y, z, preferredSupport);
+  return candidates.length > 0 ? candidates[0] : null;
+}
+
+function botIntersectsBlock(bot, x, y, z) {
+  if (!bot || !bot.entity || !bot.entity.position) {
+    return false;
+  }
+
+  const halfWidth = 0.3;
+  const position = bot.entity.position;
+  const minX = position.x - halfWidth;
+  const maxX = position.x + halfWidth;
+  const minY = position.y;
+  const maxY = position.y + (bot.entity.height || 1.8);
+  const minZ = position.z - halfWidth;
+  const maxZ = position.z + halfWidth;
+
+  return maxX > x &&
+    minX < x + 1 &&
+    maxY > y &&
+    minY < y + 1 &&
+    maxZ > z &&
+    minZ < z + 1;
+}
+
+async function moveOutOfTargetBlock(bot, x, y, z) {
+  if (!botIntersectsBlock(bot, x, y, z)) {
+    return;
+  }
+
+  const offsets = [
+    { dx: 2, dz: 0 },
+    { dx: -2, dz: 0 },
+    { dx: 0, dz: 2 },
+    { dx: 0, dz: -2 },
+    { dx: 2, dz: 2 },
+    { dx: -2, dz: 2 },
+    { dx: 2, dz: -2 },
+    { dx: -2, dz: -2 }
+  ];
+
+  for (const offset of offsets) {
+    try {
+      await ensureNear(bot, x + offset.dx, y, z + offset.dz, 1);
+    } catch (error) {
+      continue;
+    }
+
+    if (!botIntersectsBlock(bot, x, y, z)) {
+      return;
+    }
+  }
+}
+
+async function waitForExpectedBlock(bot, position, itemName, attempts, delayMs) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const block = bot.blockAt(position);
+    if (block && block.name === itemName) {
+      return block;
+    }
+    await sleep(delayMs);
+  }
+
+  return bot.blockAt(position);
+}
+
+async function sendPlacePacket(bot, support, placeOptions) {
+  const effectiveOptions = {
+    forceLook: true,
+    swingArm: "right",
+    ...(placeOptions || {})
+  };
+
+  if (typeof bot._genericPlace === "function") {
+    await bot._genericPlace(support.block, support.face, effectiveOptions);
+    return;
+  }
+
+  if (typeof bot._placeBlockWithOptions === "function") {
+    await bot._placeBlockWithOptions(support.block, support.face, effectiveOptions);
+    return;
+  }
+
+  await bot.placeBlock(support.block, support.face);
 }
 
 async function placeBlockByHand(bot, placement, options) {
@@ -709,7 +891,11 @@ async function placeBlockByHand(bot, placement, options) {
   const range = options.range;
   const placeDelayMs = options.placeDelayMs;
   const replace = options.replace;
-  const preferredSupport = options.preferredSupport || null;
+  const preferredSupport = placement.preferredSupport || options.preferredSupport || null;
+  const placeOptions = {
+    ...(placement.placeOptions || {}),
+    ...(options.placeOptions || {})
+  };
 
   await ensureInventoryItem(bot, item, 1);
 
@@ -736,39 +922,46 @@ async function placeBlockByHand(bot, placement, options) {
     await sleep(150);
   }
 
-  const support = getPlacementSupport(bot, x, y, z, preferredSupport);
-  if (!support) {
+  const supports = getPlacementSupportCandidates(bot, x, y, z, preferredSupport);
+  if (supports.length === 0) {
     throw new Error("no support block near " + blockKey(x, y, z));
   }
 
   await ensureNear(bot, x, y, z, range);
-  await equipItemByName(bot, item);
-  await bot.lookAt(new Vec3(x + 0.5, y + 0.5, z + 0.5), true);
-  try {
-    await bot.placeBlock(support.block, support.face);
-  } catch (error) {
-    await sleep(placeDelayMs);
-    const afterError = bot.blockAt(targetPos);
-    if (!afterError || afterError.name !== item) {
-      throw error;
+  await moveOutOfTargetBlock(bot, x, y, z);
+
+  let lastError = null;
+  for (const support of supports) {
+    await ensureNear(bot, x, y, z, range);
+    await moveOutOfTargetBlock(bot, x, y, z);
+    await equipItemByName(bot, item);
+
+    try {
+      await sendPlacePacket(bot, support, placeOptions);
+    } catch (error) {
+      lastError = error;
+    }
+
+    const placedAfterAttempt = await waitForExpectedBlock(bot, targetPos, item, 12, placeDelayMs);
+    if (placedAfterAttempt && placedAfterAttempt.name === item) {
+      return {
+        x,
+        y,
+        z,
+        item,
+        placed: true,
+        skipped: false,
+        finalBlock: placedAfterAttempt.name
+      };
     }
   }
-  await sleep(placeDelayMs);
 
   const placed = bot.blockAt(targetPos);
-  if (!placed || placed.name !== item) {
-    throw new Error("place verification failed at " + blockKey(x, y, z) + ", got " + (placed ? placed.name : "air"));
+  if (lastError) {
+    throw lastError;
   }
 
-  return {
-    x,
-    y,
-    z,
-    item,
-    placed: true,
-    skipped: false,
-    finalBlock: placed.name
-  };
+  throw new Error("place verification failed at " + blockKey(x, y, z) + ", got " + (placed ? placed.name : "air"));
 }
 
 async function clearBlockIfNeeded(bot, x, y, z, range, delayMs) {
@@ -874,6 +1067,215 @@ function buildSmallHousePlacements(originX, originY, originZ, wallItem, roofItem
   return sortPlacements(result);
 }
 
+function buildDecoratedTwoStoryHousePlacements(originX, originY, originZ, palette) {
+  const width = 7;
+  const depth = 7;
+  const placements = new Map();
+  const {
+    foundationItem,
+    floorItem,
+    wallItem,
+    pillarItem,
+    roofItem,
+    windowItem,
+    fenceItem,
+    lightItem,
+    leafItem,
+    doorItem,
+    stairItem
+  } = palette;
+
+  function setPlacement(x, y, z, item) {
+    placements.set(blockKey(x, y, z), { x, y, z, item });
+  }
+
+  function fillRect(x1, x2, y, z1, z2, item) {
+    for (let z = z1; z <= z2; z += 1) {
+      for (let x = x1; x <= x2; x += 1) {
+        setPlacement(x, y, z, item);
+      }
+    }
+  }
+
+  function fillPerimeter(x1, x2, y1, y2, z1, z2, item, openings) {
+    const holeKeys = openings || new Set();
+    for (let y = y1; y <= y2; y += 1) {
+      for (let x = x1; x <= x2; x += 1) {
+        const frontKey = blockKey(x, y, z1);
+        if (!holeKeys.has(frontKey)) {
+          setPlacement(x, y, z1, item);
+        }
+        const backKey = blockKey(x, y, z2);
+        if (!holeKeys.has(backKey)) {
+          setPlacement(x, y, z2, item);
+        }
+      }
+      for (let z = z1 + 1; z < z2; z += 1) {
+        const leftKey = blockKey(x1, y, z);
+        if (!holeKeys.has(leftKey)) {
+          setPlacement(x1, y, z, item);
+        }
+        const rightKey = blockKey(x2, y, z);
+        if (!holeKeys.has(rightKey)) {
+          setPlacement(x2, y, z, item);
+        }
+      }
+    }
+  }
+
+  const frontLeftX = originX;
+  const frontLeftZ = originZ;
+  const backRightX = originX + width - 1;
+  const backRightZ = originZ + depth - 1;
+  const secondFloorY = originY + 4;
+  const roofY = originY + 8;
+  const slabStaircase = isItemVariant(stairItem, "slab");
+  const stairPlacements = [
+    { x: originX + 1, y: originY + 1, z: originZ + 1 },
+    { x: originX + 1, y: originY + 2, z: originZ + 2 },
+    { x: originX + 1, y: originY + 3, z: originZ + 3 },
+    { x: originX + 1, y: originY + 4, z: originZ + 4 }
+  ].map((placement) => {
+    const result = {
+      ...placement,
+      item: stairItem,
+      preferredSupport: {
+        position: new Vec3(originX, placement.y, placement.z),
+        face: new Vec3(1, 0, 0)
+      }
+    };
+
+    if (slabStaircase) {
+      result.placeOptions = {
+        delta: new Vec3(1, 0.75, 0.5)
+      };
+    }
+
+    return result;
+  });
+  const stairwellHoles = new Set([
+    blockKey(originX + 1, secondFloorY, originZ + 2),
+    blockKey(originX + 1, secondFloorY, originZ + 3)
+  ]);
+
+  fillRect(frontLeftX, backRightX, originY, frontLeftZ, backRightZ, foundationItem);
+  fillRect(originX + 2, originX + 4, originY, originZ - 1, originZ - 1, foundationItem);
+
+  for (let z = frontLeftZ; z <= backRightZ; z += 1) {
+    for (let x = frontLeftX; x <= backRightX; x += 1) {
+      if (stairwellHoles.has(blockKey(x, secondFloorY, z))) {
+        continue;
+      }
+      setPlacement(x, secondFloorY, z, floorItem);
+    }
+  }
+  fillRect(originX + 1, originX + 5, secondFloorY, originZ - 1, originZ - 1, floorItem);
+
+  for (const stairPlacement of stairPlacements) {
+    placements.set(blockKey(stairPlacement.x, stairPlacement.y, stairPlacement.z), stairPlacement);
+  }
+
+  for (let y = originY + 1; y <= originY + 7; y += 1) {
+    setPlacement(frontLeftX, y, frontLeftZ, pillarItem);
+    setPlacement(backRightX, y, frontLeftZ, pillarItem);
+    setPlacement(frontLeftX, y, backRightZ, pillarItem);
+    setPlacement(backRightX, y, backRightZ, pillarItem);
+  }
+
+  for (let y = originY + 1; y <= originY + 3; y += 1) {
+    setPlacement(originX + 1, y, originZ - 1, fenceItem);
+    setPlacement(originX + 5, y, originZ - 1, fenceItem);
+  }
+
+  const firstFloorOpenings = new Set([
+    blockKey(originX + 3, originY + 1, originZ),
+    blockKey(originX + 3, originY + 2, originZ)
+  ]);
+  const firstFloorWindows = [
+    { x: originX + 2, y: originY + 2, z: originZ },
+    { x: originX + 4, y: originY + 2, z: originZ },
+    { x: originX + 2, y: originY + 2, z: backRightZ },
+    { x: originX + 4, y: originY + 2, z: backRightZ },
+    { x: frontLeftX, y: originY + 2, z: originZ + 4 },
+    { x: backRightX, y: originY + 2, z: originZ + 2 },
+    { x: backRightX, y: originY + 2, z: originZ + 4 },
+    { x: originX + 2, y: originY + 3, z: originZ },
+    { x: originX + 3, y: originY + 3, z: originZ },
+    { x: originX + 4, y: originY + 3, z: originZ }
+  ];
+  for (const opening of firstFloorWindows) {
+    firstFloorOpenings.add(blockKey(opening.x, opening.y, opening.z));
+  }
+
+  fillPerimeter(frontLeftX, backRightX, originY + 1, originY + 3, frontLeftZ, backRightZ, wallItem, firstFloorOpenings);
+  for (const windowPlacement of firstFloorWindows) {
+    setPlacement(windowPlacement.x, windowPlacement.y, windowPlacement.z, windowItem);
+  }
+  setPlacement(originX + 3, originY + 1, originZ, doorItem);
+
+  const secondFloorOpenings = new Set();
+  const secondFloorWindows = [
+    { x: originX + 2, y: originY + 6, z: originZ },
+    { x: originX + 3, y: originY + 6, z: originZ },
+    { x: originX + 4, y: originY + 6, z: originZ },
+    { x: originX + 2, y: originY + 6, z: backRightZ },
+    { x: originX + 3, y: originY + 6, z: backRightZ },
+    { x: originX + 4, y: originY + 6, z: backRightZ },
+    { x: frontLeftX, y: originY + 6, z: originZ + 2 },
+    { x: frontLeftX, y: originY + 6, z: originZ + 4 },
+    { x: backRightX, y: originY + 6, z: originZ + 2 },
+    { x: backRightX, y: originY + 6, z: originZ + 4 }
+  ];
+  for (const opening of secondFloorWindows) {
+    secondFloorOpenings.add(blockKey(opening.x, opening.y, opening.z));
+  }
+
+  fillPerimeter(frontLeftX, backRightX, originY + 5, originY + 7, frontLeftZ, backRightZ, wallItem, secondFloorOpenings);
+  for (const windowPlacement of secondFloorWindows) {
+    setPlacement(windowPlacement.x, windowPlacement.y, windowPlacement.z, windowItem);
+  }
+
+  fillRect(frontLeftX, backRightX, roofY, frontLeftZ, backRightZ, roofItem);
+  fillRect(originX + 1, originX + 5, roofY, originZ - 1, originZ - 1, roofItem);
+
+  for (let x = frontLeftX; x <= backRightX; x += 1) {
+    setPlacement(x, roofY + 1, frontLeftZ, fenceItem);
+    setPlacement(x, roofY + 1, backRightZ, fenceItem);
+  }
+  for (let z = frontLeftZ + 1; z < backRightZ; z += 1) {
+    setPlacement(frontLeftX, roofY + 1, z, fenceItem);
+    setPlacement(backRightX, roofY + 1, z, fenceItem);
+  }
+
+  const lanternPlacements = [
+    { x: originX + 5, y: originY + 1, z: originZ + 1 },
+    { x: originX + 3, y: originY + 1, z: originZ + 5 },
+    { x: originX + 2, y: secondFloorY + 1, z: originZ + 1 },
+    { x: originX + 4, y: secondFloorY + 1, z: originZ + 1 },
+    { x: frontLeftX + 1, y: roofY + 1, z: frontLeftZ + 1 },
+    { x: backRightX - 1, y: roofY + 1, z: frontLeftZ + 1 },
+    { x: frontLeftX + 1, y: roofY + 1, z: backRightZ - 1 },
+    { x: backRightX - 1, y: roofY + 1, z: backRightZ - 1 }
+  ];
+  for (const lanternPlacement of lanternPlacements) {
+    setPlacement(lanternPlacement.x, lanternPlacement.y, lanternPlacement.z, lightItem);
+  }
+
+  const shrubPlacements = [
+    { x: originX - 1, y: originY + 1, z: originZ + 1 },
+    { x: originX - 1, y: originY + 1, z: originZ + 5 },
+    { x: backRightX + 1, y: originY + 1, z: originZ + 1 },
+    { x: backRightX + 1, y: originY + 1, z: originZ + 5 },
+    { x: originX + 2, y: originY + 1, z: originZ - 2 },
+    { x: originX + 4, y: originY + 1, z: originZ - 2 }
+  ];
+  for (const shrubPlacement of shrubPlacements) {
+    setPlacement(shrubPlacement.x, shrubPlacement.y, shrubPlacement.z, leafItem);
+  }
+
+  return sortPlacements(Array.from(placements.values()));
+}
+
 function countInventoryItem(bot, itemName) {
   const normalized = registryItemName(itemName);
   return bot.inventory.items()
@@ -963,7 +1365,8 @@ async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
       z,
       placed: false,
       skipped: true,
-      finalBlock: existing.name
+      finalBlock: existing.name,
+      method: "existing"
     };
   }
 
@@ -976,11 +1379,61 @@ async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
     throw new Error("water support missing at " + blockKey(x, y - 1, z));
   }
 
-  await ensureInventoryItem(bot, itemName, 1);
-  await ensureNear(bot, x, y, z, range);
-  await equipItemByName(bot, itemName);
-  await bot.activateBlock(supportBlock, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5));
+  try {
+    await ensureInventoryItem(bot, itemName, 1);
+    await ensureNear(bot, x, y, z, range);
+    await equipItemByName(bot, itemName);
+    try {
+      if (typeof bot._placeBlockWithOptions === "function") {
+        await bot._placeBlockWithOptions(supportBlock, new Vec3(0, 1, 0), {
+          delta: new Vec3(0.5, 1, 0.5),
+          forceLook: true,
+          swingArm: "right"
+        });
+      } else {
+        await bot.activateBlock(supportBlock, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5));
+      }
+    } catch (error) {
+      const placedAfterError = bot.blockAt(targetPos);
+      if (!placedAfterError || placedAfterError.name !== "water") {
+        throw error;
+      }
+    }
 
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await sleep(delayMs);
+      const placed = bot.blockAt(targetPos);
+      if (placed && placed.name === "water") {
+        return {
+          x,
+          y,
+          z,
+          placed: true,
+          skipped: false,
+          finalBlock: placed.name,
+          method: "bucket"
+        };
+      }
+    }
+  } catch (error) {
+    // fall through to ice fallback
+  }
+
+  const iceItem = "ice";
+  await ensureInventoryItem(bot, iceItem, 1);
+  await placeBlockByHand(bot, { x, y, z, item: iceItem }, {
+    range,
+    placeDelayMs: delayMs,
+    replace: false
+  });
+
+  const iceBlock = bot.blockAt(targetPos);
+  if (!iceBlock || iceBlock.name !== iceItem) {
+    throw new Error("failed to place ice at " + blockKey(x, y, z));
+  }
+
+  await ensureNear(bot, x, y, z, range);
+  await bot.dig(iceBlock, true);
   for (let attempt = 0; attempt < 12; attempt += 1) {
     await sleep(delayMs);
     const placed = bot.blockAt(targetPos);
@@ -991,7 +1444,8 @@ async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
         z,
         placed: true,
         skipped: false,
-        finalBlock: placed.name
+        finalBlock: placed.name,
+        method: "ice"
       };
     }
   }
@@ -1018,46 +1472,37 @@ async function isDoubleChestContainer(bot, x, y, z, range) {
 async function placeDoubleChestByHand(bot, firstPlacement, secondPlacement, options) {
   const range = options.range;
   const placeDelayMs = options.placeDelayMs;
-  const firstPos = new Vec3(firstPlacement.x, firstPlacement.y, firstPlacement.z);
-  const secondPos = new Vec3(secondPlacement.x, secondPlacement.y, secondPlacement.z);
-  const preferredSupport = {
-    position: firstPos,
-    face: new Vec3(
-      secondPlacement.x - firstPlacement.x,
-      secondPlacement.y - firstPlacement.y,
-      secondPlacement.z - firstPlacement.z
-    )
-  };
+  const chestY = firstPlacement.y;
+  const centerX = (firstPlacement.x + secondPlacement.x) / 2;
+  const centerZ = (firstPlacement.z + secondPlacement.z) / 2;
+  const standPoints = [
+    { x: centerX, y: chestY, z: centerZ + 2 },
+    { x: centerX, y: chestY, z: centerZ - 2 },
+    { x: centerX - 2, y: chestY, z: centerZ },
+    { x: centerX + 2, y: chestY, z: centerZ }
+  ];
 
-  await placeBlockByHand(bot, firstPlacement, {
-    range,
-    placeDelayMs,
-    replace: false
-  });
+  for (const standPoint of standPoints) {
+    await clearBlockIfNeeded(bot, firstPlacement.x, firstPlacement.y, firstPlacement.z, range, placeDelayMs);
+    await clearBlockIfNeeded(bot, secondPlacement.x, secondPlacement.y, secondPlacement.z, range, placeDelayMs);
+    await ensureNear(bot, standPoint.x, standPoint.y, standPoint.z, 0.6);
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const secondBlock = bot.blockAt(secondPos);
-    if (!secondBlock || secondBlock.name !== secondPlacement.item) {
-      await placeBlockByHand(bot, secondPlacement, {
-        range,
-        placeDelayMs,
-        replace: false,
-        preferredSupport
-      });
-    }
+    await placeBlockByHand(bot, firstPlacement, {
+      range,
+      placeDelayMs,
+      replace: false
+    });
+    await placeBlockByHand(bot, secondPlacement, {
+      range,
+      placeDelayMs,
+      replace: false
+    });
 
     if (await isDoubleChestContainer(bot, firstPlacement.x, firstPlacement.y, firstPlacement.z, range)) {
       return {
         placed: true,
         merged: true
       };
-    }
-
-    const retryBlock = bot.blockAt(secondPos);
-    if (retryBlock && retryBlock.name === secondPlacement.item) {
-      await ensureNear(bot, secondPlacement.x, secondPlacement.y, secondPlacement.z, range);
-      await bot.dig(retryBlock, true);
-      await sleep(placeDelayMs);
     }
   }
 
@@ -1185,23 +1630,57 @@ async function placeItem(body) {
   const x = numberValue(body, "x");
   const y = numberValue(body, "y");
   const z = numberValue(body, "z");
+  const range = numberValue(body, "range", 4);
+  const placeDelayMs = numberValue(body, "placeDelayMs", 150);
+  const replace = boolValue(body, "replace", false);
+  let preferredSupport = null;
+  const placeOptions = {};
 
-  await ensureNear(bot, x, y, z, numberValue(body, "range", 4));
-  await equipItemByName(bot, itemName);
-
-  const support = bot.blockAt(new Vec3(x, y - 1, z));
-  if (!support || isAir(support)) {
-    throw new Error("support block missing at " + x + "," + (y - 1) + "," + z);
+  if ("supportX" in body && "supportY" in body && "supportZ" in body && "faceX" in body && "faceY" in body && "faceZ" in body) {
+    preferredSupport = {
+      position: new Vec3(
+        Math.floor(numberValue(body, "supportX")),
+        Math.floor(numberValue(body, "supportY")),
+        Math.floor(numberValue(body, "supportZ"))
+      ),
+      face: new Vec3(
+        Math.floor(numberValue(body, "faceX")),
+        Math.floor(numberValue(body, "faceY")),
+        Math.floor(numberValue(body, "faceZ"))
+      )
+    };
   }
 
-  await bot.lookAt(new Vec3(x + 0.5, y + 0.5, z + 0.5), true);
-  await bot.placeBlock(support, new Vec3(0, 1, 0));
-  await sleep(200);
+  if ("deltaX" in body && "deltaY" in body && "deltaZ" in body) {
+    placeOptions.delta = new Vec3(
+      numberValue(body, "deltaX"),
+      numberValue(body, "deltaY"),
+      numberValue(body, "deltaZ")
+    );
+  }
 
-  const placed = bot.blockAt(new Vec3(x, y, z));
+  if ("half" in body) {
+    const half = String(body.half || "").toLowerCase();
+    if (half === "top" || half === "bottom") {
+      placeOptions.half = half;
+    }
+  }
+
+  if ("forceLook" in body) {
+    placeOptions.forceLook = boolValue(body, "forceLook", true);
+  }
+
+  const result = await placeBlockByHand(bot, { x, y, z, item: itemName }, {
+    range,
+    placeDelayMs,
+    replace,
+    preferredSupport,
+    placeOptions
+  });
+
   return {
     ok: true,
-    placed: placed ? placed.name : ""
+    placed: result.finalBlock
   };
 }
 
@@ -1437,6 +1916,135 @@ async function buildSmallHouse(body) {
   });
 }
 
+async function buildDecoratedTwoStoryHouse(body) {
+  return actionManager.run("build_decorated_two_story_house", async (manager) => {
+    const bot = requireBot();
+    const x = Math.floor(numberValue(body, "x"));
+    const y = Math.floor(numberValue(body, "y"));
+    const z = Math.floor(numberValue(body, "z"));
+    const foundationItem = stringValue(body, "foundationItem", "stone_bricks");
+    const floorItem = stringValue(body, "floorItem", "spruce_planks");
+    const wallItem = stringValue(body, "wallItem", "birch_planks");
+    const pillarItem = stringValue(body, "pillarItem", "oak_log");
+    const roofItem = stringValue(body, "roofItem", "dark_oak_planks");
+    const windowItem = stringValue(body, "windowItem", "glass_pane");
+    const fenceItem = stringValue(body, "fenceItem", "oak_fence");
+    const lightItem = stringValue(body, "lightItem", "lantern");
+    const leafItem = stringValue(body, "leafItem", "oak_leaves");
+    const doorItem = stringValue(body, "doorItem", "oak_door");
+    const stairItem = stringValue(body, "stairItem", deriveRelatedItemName(floorItem, "slab"));
+    const range = numberValue(body, "range", 4);
+    const placeDelayMs = numberValue(body, "placeDelayMs", 150);
+    const continueOnError = boolValue(body, "continueOnError", false);
+    const placements = buildDecoratedTwoStoryHousePlacements(x, y, z, {
+      foundationItem,
+      floorItem,
+      wallItem,
+      pillarItem,
+      roofItem,
+      windowItem,
+      fenceItem,
+      lightItem,
+      leafItem,
+      doorItem,
+      stairItem
+    });
+    const secondFloorY = y + 4;
+    const roofY = y + 8;
+    const lowerPlacements = placements.filter((placement) => placement.y <= secondFloorY);
+    const upperPlacements = placements.filter((placement) => placement.y > secondFloorY);
+    const roofExtensionPlacements = upperPlacements.filter((placement) => placement.y === roofY && placement.z === z - 1);
+    const upperCorePlacements = upperPlacements.filter((placement) => !(placement.y === roofY && placement.z === z - 1));
+    const results = [];
+
+    await ensureInventoryItem(bot, foundationItem, 64);
+    await ensureInventoryItem(bot, floorItem, 64);
+    await ensureInventoryItem(bot, wallItem, 160);
+    await ensureInventoryItem(bot, pillarItem, 32);
+    await ensureInventoryItem(bot, roofItem, 96);
+    await ensureInventoryItem(bot, windowItem, 32);
+    await ensureInventoryItem(bot, fenceItem, 48);
+    await ensureInventoryItem(bot, lightItem, 16);
+    await ensureInventoryItem(bot, leafItem, 16);
+    await ensureInventoryItem(bot, doorItem, 1);
+    await ensureInventoryItem(bot, stairItem, 16);
+
+    async function placePlacementList(list) {
+      for (const placement of list) {
+        if (manager.isCancelled()) {
+          throw new Error("action cancelled");
+        }
+
+        try {
+          const result = await placeBlockByHand(bot, placement, {
+            range,
+            placeDelayMs,
+            replace: true
+          });
+          results.push({
+            ...result,
+            success: true
+          });
+        } catch (error) {
+          const failure = {
+            x: placement.x,
+            y: placement.y,
+            z: placement.z,
+            item: placement.item,
+            success: false,
+            error: error && error.message ? error.message : String(error)
+          };
+          results.push(failure);
+          if (!continueOnError) {
+            return false;
+          }
+        }
+      }
+
+      return true;
+    }
+
+    const lowerOk = await placePlacementList(lowerPlacements);
+    if (!lowerOk) {
+      return {
+        ok: false,
+        action: "build_decorated_two_story_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    await ensureNear(bot, x + 2, secondFloorY + 1, z + 4, 1);
+
+    const upperOk = await placePlacementList(upperCorePlacements);
+    if (!upperOk) {
+      return {
+        ok: false,
+        action: "build_decorated_two_story_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    const roofOk = await placePlacementList(roofExtensionPlacements);
+    if (!roofOk) {
+      return {
+        ok: false,
+        action: "build_decorated_two_story_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    return {
+      ok: true,
+      action: "build_decorated_two_story_house",
+      placedCount: results.filter((entry) => entry.success).length,
+      results
+    };
+  });
+}
+
 async function farmStoreFive(body) {
   return actionManager.run("farm_store_five", async (manager) => {
     const bot = requireBot();
@@ -1456,6 +2064,8 @@ async function farmStoreFive(body) {
     const width = 5;
     const depth = 5;
     const cropY = supportY + 1;
+    const waterY = supportY;
+    const waterFloorY = supportY - 1;
     const centerX = originX + 2;
     const centerZ = originZ + 2;
     const chestAX = originX + width + 2;
@@ -1470,6 +2080,7 @@ async function farmStoreFive(body) {
       harvested: 0,
       wheatCount: 0,
       waterPlaced: false,
+      waterMethod: "",
       chestPlaced: false,
       chestMerged: false,
       patternPlaced: false
@@ -1502,9 +2113,15 @@ async function farmStoreFive(body) {
       const supportTargets = [];
       for (let dz = 0; dz < depth; dz += 1) {
         for (let dx = 0; dx < width; dx += 1) {
-          supportTargets.push({ x: originX + dx, y: supportY, z: originZ + dz });
+          const x = originX + dx;
+          const z = originZ + dz;
+          if (x === centerX && z === centerZ) {
+            continue;
+          }
+          supportTargets.push({ x, y: supportY, z });
         }
       }
+      supportTargets.push({ x: centerX, y: waterFloorY, z: centerZ });
       supportTargets.push({ x: chestAX, y: supportY, z: chestAZ });
       supportTargets.push({ x: chestAX + 1, y: supportY, z: chestAZ });
 
@@ -1524,14 +2141,16 @@ async function farmStoreFive(body) {
       }
     }
 
-    const centerSupport = bot.blockAt(new Vec3(centerX, supportY, centerZ));
-    if (!centerSupport || isAir(centerSupport)) {
-      throw new Error("farm center support missing at " + blockKey(centerX, supportY, centerZ));
+    await clearBlockIfNeeded(bot, centerX, waterY, centerZ, range, useDelayMs, ["water"]);
+
+    const waterFloorBlock = bot.blockAt(new Vec3(centerX, waterFloorY, centerZ));
+    if (!waterFloorBlock || isAir(waterFloorBlock)) {
+      throw new Error("farm water floor missing at " + blockKey(centerX, waterFloorY, centerZ));
     }
 
-    await clearBlockIfNeeded(bot, centerX, cropY, centerZ, range, useDelayMs, ["water"]);
-    await placeWaterSourceByHand(bot, waterItem, centerX, cropY, centerZ, range, useDelayMs);
+    const waterResult = await placeWaterSourceByHand(bot, waterItem, centerX, waterY, centerZ, range, useDelayMs);
     results.waterPlaced = true;
+    results.waterMethod = waterResult.method;
 
     for (const position of cropPositions) {
       if (manager.isCancelled()) {
@@ -1657,6 +2276,11 @@ async function farmStoreFive(body) {
 async function runAction(body) {
   const action = stringValue(body, "action");
   switch (action) {
+    case "build_decorated_two_story_house":
+    case "build-decorated-two-story-house":
+    case "build_two_story_house":
+    case "build-two-story-house":
+      return buildDecoratedTwoStoryHouse(body);
     case "farm_store_five":
     case "farm-store-five":
       return farmStoreFive(body);
@@ -1740,6 +2364,17 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "GET" && url.pathname === "/inventory") {
       sendJson(response, 200, getInventoryPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/block") {
+      const x = Math.floor(Number(url.searchParams.get("x")));
+      const y = Math.floor(Number(url.searchParams.get("y")));
+      const z = Math.floor(Number(url.searchParams.get("z")));
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        throw new Error("x, y and z query params are required");
+      }
+      sendJson(response, 200, getBlockPayload(x, y, z));
       return;
     }
 
