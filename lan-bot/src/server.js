@@ -1017,6 +1017,33 @@ function sortPlacements(placements) {
   });
 }
 
+async function ensurePlacementInventory(bot, placements, extraRequirements) {
+  const requiredCounts = new Map();
+
+  for (const placement of placements) {
+    const itemName = String(placement.item || "");
+    if (!itemName) {
+      continue;
+    }
+    requiredCounts.set(itemName, (requiredCounts.get(itemName) || 0) + 1);
+  }
+
+  if (extraRequirements) {
+    for (const [itemName, extraCount] of Object.entries(extraRequirements)) {
+      const count = Math.max(0, Math.floor(extraCount || 0));
+      if (count <= 0) {
+        continue;
+      }
+      requiredCounts.set(itemName, (requiredCounts.get(itemName) || 0) + count);
+    }
+  }
+
+  const entries = Array.from(requiredCounts.entries()).sort((left, right) => right[1] - left[1]);
+  for (const [itemName, count] of entries) {
+    await ensureInventoryItem(bot, itemName, count);
+  }
+}
+
 function buildSmallHousePlacements(originX, originY, originZ, wallItem, roofItem, windowItem, lightItem) {
   const placements = [];
   const width = 5;
@@ -1271,6 +1298,239 @@ function buildDecoratedTwoStoryHousePlacements(originX, originY, originZ, palett
   ];
   for (const shrubPlacement of shrubPlacements) {
     setPlacement(shrubPlacement.x, shrubPlacement.y, shrubPlacement.z, leafItem);
+  }
+
+  return sortPlacements(Array.from(placements.values()));
+}
+
+function buildRusticBalconyHousePlacements(originX, originY, originZ, palette) {
+  const width = 11;
+  const depth = 8;
+  const placements = new Map();
+  const {
+    foundationItem,
+    baseAccentItem,
+    floorItem,
+    wallItem,
+    beamItem,
+    roofItem,
+    roofAccentItem,
+    windowItem,
+    fenceItem,
+    lightItem,
+    doorItem,
+    stairItem,
+    leafItem
+  } = palette;
+
+  function setPlacement(x, y, z, item) {
+    placements.set(blockKey(x, y, z), { x, y, z, item });
+  }
+
+  function setPlacementData(entry) {
+    placements.set(blockKey(entry.x, entry.y, entry.z), entry);
+  }
+
+  function fillRect(x1, x2, y, z1, z2, item) {
+    for (let z = z1; z <= z2; z += 1) {
+      for (let x = x1; x <= x2; x += 1) {
+        setPlacement(x, y, z, item);
+      }
+    }
+  }
+
+  function fillPerimeter(x1, x2, y1, y2, z1, z2, item, openings) {
+    const holeKeys = openings || new Set();
+    for (let y = y1; y <= y2; y += 1) {
+      for (let x = x1; x <= x2; x += 1) {
+        const frontKey = blockKey(x, y, z1);
+        if (!holeKeys.has(frontKey)) {
+          setPlacement(x, y, z1, item);
+        }
+        const backKey = blockKey(x, y, z2);
+        if (!holeKeys.has(backKey)) {
+          setPlacement(x, y, z2, item);
+        }
+      }
+
+      for (let z = z1 + 1; z < z2; z += 1) {
+        const leftKey = blockKey(x1, y, z);
+        if (!holeKeys.has(leftKey)) {
+          setPlacement(x1, y, z, item);
+        }
+        const rightKey = blockKey(x2, y, z);
+        if (!holeKeys.has(rightKey)) {
+          setPlacement(x2, y, z, item);
+        }
+      }
+    }
+  }
+
+  function fillColumn(x, y1, y2, z, item) {
+    for (let y = y1; y <= y2; y += 1) {
+      setPlacement(x, y, z, item);
+    }
+  }
+
+  const frontLeftX = originX;
+  const frontLeftZ = originZ;
+  const backRightX = originX + width - 1;
+  const backRightZ = originZ + depth - 1;
+  const balconyZ = originZ - 1;
+  const frontPathZ = originZ - 2;
+  const upperFloorY = originY + 4;
+  const upperWallStartY = originY + 5;
+  const upperWallTopY = originY + 7;
+  const roofBaseY = originY + 8;
+  const slabStaircase = isItemVariant(stairItem, "slab");
+
+  const stairPlacements = [
+    { x: originX + 2, y: originY + 1, z: originZ + 2 },
+    { x: originX + 2, y: originY + 2, z: originZ + 3 },
+    { x: originX + 2, y: originY + 3, z: originZ + 4 },
+    { x: originX + 2, y: originY + 4, z: originZ + 5 }
+  ].map((placement) => {
+    const result = {
+      ...placement,
+      item: stairItem,
+      preferredSupport: {
+        position: new Vec3(originX + 1, placement.y, placement.z),
+        face: new Vec3(1, 0, 0)
+      }
+    };
+
+    if (slabStaircase) {
+      result.placeOptions = {
+        delta: new Vec3(1, 0.75, 0.5)
+      };
+    }
+
+    return result;
+  });
+
+  const stairwellHoles = new Set([
+    blockKey(originX + 2, upperFloorY, originZ + 3),
+    blockKey(originX + 2, upperFloorY, originZ + 4)
+  ]);
+
+  fillRect(frontLeftX, backRightX, originY, frontLeftZ, backRightZ, foundationItem);
+  fillRect(originX + 2, originX + 8, originY, balconyZ, balconyZ, foundationItem);
+  fillRect(originX + 4, originX + 6, originY, frontPathZ, frontPathZ, foundationItem);
+  setPlacement(originX + 1, originY, frontPathZ, foundationItem);
+  setPlacement(originX + 9, originY, frontPathZ, foundationItem);
+
+  const baseOpenings = new Set();
+  for (let y = originY + 1; y <= originY + 2; y += 1) {
+    for (let x = originX + 4; x <= originX + 6; x += 1) {
+      baseOpenings.add(blockKey(x, y, originZ));
+    }
+    baseOpenings.add(blockKey(originX + 1, y, originZ));
+    baseOpenings.add(blockKey(originX + 9, y, originZ));
+  }
+
+  fillPerimeter(frontLeftX, backRightX, originY + 1, originY + 3, frontLeftZ, backRightZ, foundationItem, baseOpenings);
+
+  fillColumn(originX, originY + 1, originY + 3, originZ, baseAccentItem);
+  fillColumn(originX + 3, originY + 1, originY + 3, originZ, baseAccentItem);
+  fillColumn(originX + 7, originY + 1, originY + 3, originZ, baseAccentItem);
+  fillColumn(originX + 10, originY + 1, originY + 3, originZ, baseAccentItem);
+  fillColumn(originX, originY + 1, originY + 3, backRightZ, baseAccentItem);
+  fillColumn(originX + 10, originY + 1, originY + 3, backRightZ, baseAccentItem);
+
+  for (let x = originX + 4; x <= originX + 6; x += 1) {
+    setPlacement(x, originY + 3, originZ, baseAccentItem);
+  }
+
+  setPlacement(originX + 1, originY + 1, originZ, doorItem);
+  setPlacement(originX + 9, originY + 1, originZ, doorItem);
+
+  fillRect(originX + 4, originX + 6, originY + 1, balconyZ, originZ + 2, floorItem);
+  fillColumn(originX + 2, originY + 1, originY + 3, originZ, beamItem);
+  fillColumn(originX + 8, originY + 1, originY + 3, originZ, beamItem);
+  fillColumn(originX + 4, originY + 1, originY + 2, frontPathZ, beamItem);
+  fillColumn(originX + 6, originY + 1, originY + 2, frontPathZ, beamItem);
+  setPlacement(originX + 4, originY + 3, frontPathZ, lightItem);
+  setPlacement(originX + 6, originY + 3, frontPathZ, lightItem);
+  setPlacement(originX + 1, originY + 1, frontPathZ, leafItem);
+  setPlacement(originX + 9, originY + 1, frontPathZ, leafItem);
+
+  for (let z = frontLeftZ; z <= backRightZ; z += 1) {
+    for (let x = originX + 1; x <= originX + 9; x += 1) {
+      if (stairwellHoles.has(blockKey(x, upperFloorY, z))) {
+        continue;
+      }
+      setPlacement(x, upperFloorY, z, floorItem);
+    }
+  }
+  fillRect(originX + 2, originX + 8, upperFloorY, balconyZ, balconyZ, floorItem);
+
+  for (const stairPlacement of stairPlacements) {
+    setPlacementData(stairPlacement);
+  }
+
+  const upperOpenings = new Set([
+    blockKey(originX + 2, upperWallStartY + 1, originZ + 1),
+    blockKey(originX + 8, upperWallStartY + 1, originZ + 1),
+    blockKey(originX + 1, upperWallStartY + 1, originZ + 3),
+    blockKey(originX + 1, upperWallStartY + 1, originZ + 5),
+    blockKey(originX + 9, upperWallStartY + 1, originZ + 3),
+    blockKey(originX + 9, upperWallStartY + 1, originZ + 5),
+    blockKey(originX + 3, upperWallStartY + 1, backRightZ),
+    blockKey(originX + 5, upperWallStartY + 1, backRightZ),
+    blockKey(originX + 7, upperWallStartY + 1, backRightZ)
+  ]);
+
+  fillPerimeter(originX + 1, originX + 9, upperWallStartY, upperWallTopY, originZ + 1, backRightZ, wallItem, upperOpenings);
+
+  fillColumn(originX + 1, upperWallStartY, upperWallTopY, originZ + 1, beamItem);
+  fillColumn(originX + 9, upperWallStartY, upperWallTopY, originZ + 1, beamItem);
+  fillColumn(originX + 1, upperWallStartY, upperWallTopY, backRightZ, beamItem);
+  fillColumn(originX + 9, upperWallStartY, upperWallTopY, backRightZ, beamItem);
+
+  setPlacement(originX + 2, upperWallStartY + 1, originZ + 1, windowItem);
+  setPlacement(originX + 8, upperWallStartY + 1, originZ + 1, windowItem);
+  setPlacement(originX + 1, upperWallStartY + 1, originZ + 3, windowItem);
+  setPlacement(originX + 1, upperWallStartY + 1, originZ + 5, windowItem);
+  setPlacement(originX + 9, upperWallStartY + 1, originZ + 3, windowItem);
+  setPlacement(originX + 9, upperWallStartY + 1, originZ + 5, windowItem);
+  setPlacement(originX + 3, upperWallStartY + 1, backRightZ, windowItem);
+  setPlacement(originX + 5, upperWallStartY + 1, backRightZ, windowItem);
+  setPlacement(originX + 7, upperWallStartY + 1, backRightZ, windowItem);
+
+  fillColumn(originX + 3, upperWallStartY, upperWallTopY, originZ, wallItem);
+  fillColumn(originX + 4, upperWallStartY, upperWallTopY, originZ, beamItem);
+  fillColumn(originX + 6, upperWallStartY, upperWallTopY, originZ, beamItem);
+  fillColumn(originX + 7, upperWallStartY, upperWallTopY, originZ, wallItem);
+  setPlacement(originX + 5, upperWallTopY, originZ, wallItem);
+  setPlacement(originX + 3, upperWallStartY + 1, originZ, windowItem);
+  setPlacement(originX + 7, upperWallStartY + 1, originZ, windowItem);
+  setPlacement(originX + 5, upperWallStartY, originZ, doorItem);
+
+  for (let x = originX + 2; x <= originX + 8; x += 1) {
+    if (x === originX + 4 || x === originX + 6) {
+      continue;
+    }
+    setPlacement(x, upperWallStartY, balconyZ, fenceItem);
+  }
+  setPlacement(originX + 2, upperWallStartY, originZ, fenceItem);
+  setPlacement(originX + 8, upperWallStartY, originZ, fenceItem);
+  setPlacement(originX + 4, upperWallStartY, balconyZ, lightItem);
+  setPlacement(originX + 6, upperWallStartY, balconyZ, lightItem);
+
+  const roofTiers = [
+    { y: roofBaseY, x1: frontLeftX, x2: backRightX },
+    { y: roofBaseY + 1, x1: frontLeftX + 1, x2: backRightX - 1 },
+    { y: roofBaseY + 2, x1: frontLeftX + 2, x2: backRightX - 2 },
+    { y: roofBaseY + 3, x1: frontLeftX + 3, x2: backRightX - 3 },
+    { y: roofBaseY + 4, x1: frontLeftX + 4, x2: backRightX - 4 }
+  ];
+
+  for (const roofTier of roofTiers) {
+    fillRect(roofTier.x1, roofTier.x2, roofTier.y, frontLeftZ, backRightZ, roofItem);
+  }
+
+  for (let z = frontLeftZ; z <= backRightZ; z += 1) {
+    setPlacement(originX + 5, roofBaseY + 4, z, roofAccentItem);
   }
 
   return sortPlacements(Array.from(placements.values()));
@@ -1934,6 +2194,7 @@ async function buildDecoratedTwoStoryHouse(body) {
     const doorItem = stringValue(body, "doorItem", "oak_door");
     const stairItem = stringValue(body, "stairItem", deriveRelatedItemName(floorItem, "slab"));
     const range = numberValue(body, "range", 4);
+    const roofRange = numberValue(body, "roofRange", Math.max(range, 8));
     const placeDelayMs = numberValue(body, "placeDelayMs", 150);
     const continueOnError = boolValue(body, "continueOnError", false);
     const placements = buildDecoratedTwoStoryHousePlacements(x, y, z, {
@@ -2039,6 +2300,189 @@ async function buildDecoratedTwoStoryHouse(body) {
     return {
       ok: true,
       action: "build_decorated_two_story_house",
+      placedCount: results.filter((entry) => entry.success).length,
+      results
+    };
+  });
+}
+
+async function buildRusticBalconyHouse(body) {
+  return actionManager.run("build_rustic_balcony_house", async (manager) => {
+    const bot = requireBot();
+    const x = Math.floor(numberValue(body, "x"));
+    const y = Math.floor(numberValue(body, "y"));
+    const z = Math.floor(numberValue(body, "z"));
+    const foundationItem = stringValue(body, "foundationItem", "cobblestone");
+    const baseAccentItem = stringValue(body, "baseAccentItem", "stone_bricks");
+    const floorItem = stringValue(body, "floorItem", "spruce_planks");
+    const wallItem = stringValue(body, "wallItem", "spruce_planks");
+    const beamItem = stringValue(body, "beamItem", "stripped_spruce_log");
+    const roofItem = stringValue(body, "roofItem", "dark_oak_planks");
+    const roofAccentItem = stringValue(body, "roofAccentItem", deriveRelatedItemName(roofItem, "slab"));
+    const windowItem = stringValue(body, "windowItem", "glass_pane");
+    const fenceItem = stringValue(body, "fenceItem", "spruce_fence");
+    const lightItem = stringValue(body, "lightItem", "lantern");
+    const doorItem = stringValue(body, "doorItem", "spruce_door");
+    const leafItem = stringValue(body, "leafItem", "oak_leaves");
+    const stairItem = stringValue(body, "stairItem", deriveRelatedItemName(floorItem, "slab"));
+    const range = numberValue(body, "range", 4);
+    const roofRange = numberValue(body, "roofRange", Math.max(range, 8));
+    const placeDelayMs = numberValue(body, "placeDelayMs", 150);
+    const continueOnError = boolValue(body, "continueOnError", false);
+    const placements = buildRusticBalconyHousePlacements(x, y, z, {
+      foundationItem,
+      baseAccentItem,
+      floorItem,
+      wallItem,
+      beamItem,
+      roofItem,
+      roofAccentItem,
+      windowItem,
+      fenceItem,
+      lightItem,
+      doorItem,
+      stairItem,
+      leafItem
+    });
+    const upperFloorY = y + 4;
+    const roofBaseY = y + 8;
+    const lowerPlacements = placements.filter((placement) => placement.y <= upperFloorY);
+    const wallPlacements = placements.filter((placement) => placement.y > upperFloorY && placement.y < roofBaseY);
+    const roofCenterX = x + 5;
+    const roofCenterZ = z + 3;
+    const roofPlacements = placements
+      .filter((placement) => placement.y >= roofBaseY)
+      .slice()
+      .sort((left, right) => {
+        if (left.y !== right.y) {
+          return left.y - right.y;
+        }
+
+        const leftDistance = Math.abs(left.x - roofCenterX) + Math.abs(left.z - roofCenterZ);
+        const rightDistance = Math.abs(right.x - roofCenterX) + Math.abs(right.z - roofCenterZ);
+        if (leftDistance !== rightDistance) {
+          return leftDistance - rightDistance;
+        }
+
+        if (left.z !== right.z) {
+          return left.z - right.z;
+        }
+        return left.x - right.x;
+      });
+    const results = [];
+
+    await ensurePlacementInventory(bot, placements, {
+      [lightItem]: 4,
+      [doorItem]: 2
+    });
+
+    async function placePlacementList(list) {
+      for (const placement of list) {
+        if (manager.isCancelled()) {
+          throw new Error("action cancelled");
+        }
+
+        try {
+          const result = await placeBlockByHand(bot, placement, {
+            range,
+            placeDelayMs,
+            replace: true
+          });
+          results.push({
+            ...result,
+            success: true
+          });
+        } catch (error) {
+          const failure = {
+            x: placement.x,
+            y: placement.y,
+            z: placement.z,
+            item: placement.item,
+            success: false,
+            error: error && error.message ? error.message : String(error)
+          };
+          results.push(failure);
+          if (!continueOnError) {
+            return false;
+          }
+        }
+      }
+
+      return true;
+    }
+
+    const lowerOk = await placePlacementList(lowerPlacements);
+    if (!lowerOk) {
+      return {
+        ok: false,
+        action: "build_rustic_balcony_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    await ensureNear(bot, x + 5, upperFloorY + 1, z + 4, 1);
+
+    const upperOk = await placePlacementList(wallPlacements);
+    if (!upperOk) {
+      return {
+        ok: false,
+        action: "build_rustic_balcony_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    await ensureNear(bot, x + 5, upperFloorY + 1, z + 4, 1);
+
+    async function placeRoofPlacementList(list) {
+      for (const placement of list) {
+        if (manager.isCancelled()) {
+          throw new Error("action cancelled");
+        }
+
+        try {
+          const result = await placeBlockByHand(bot, placement, {
+            range: roofRange,
+            placeDelayMs,
+            replace: true
+          });
+          results.push({
+            ...result,
+            success: true
+          });
+        } catch (error) {
+          const failure = {
+            x: placement.x,
+            y: placement.y,
+            z: placement.z,
+            item: placement.item,
+            success: false,
+            error: error && error.message ? error.message : String(error)
+          };
+          results.push(failure);
+          if (!continueOnError) {
+            return false;
+          }
+        }
+      }
+
+      return true;
+    }
+
+    const roofOk = await placeRoofPlacementList(roofPlacements);
+    if (!roofOk) {
+      return {
+        ok: false,
+        action: "build_rustic_balcony_house",
+        placedCount: results.filter((entry) => entry.success).length,
+        results
+      };
+    }
+
+    return {
+      ok: true,
+      action: "build_rustic_balcony_house",
       placedCount: results.filter((entry) => entry.success).length,
       results
     };
@@ -2276,6 +2720,13 @@ async function farmStoreFive(body) {
 async function runAction(body) {
   const action = stringValue(body, "action");
   switch (action) {
+    case "build_rustic_balcony_house":
+    case "build-rustic-balcony-house":
+    case "build_picture_house":
+    case "build-picture-house":
+    case "build_reference_house":
+    case "build-reference-house":
+      return buildRusticBalconyHouse(body);
     case "build_decorated_two_story_house":
     case "build-decorated-two-story-house":
     case "build_two_story_house":
