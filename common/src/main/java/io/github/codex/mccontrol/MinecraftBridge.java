@@ -6,6 +6,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -66,6 +67,8 @@ public final class MinecraftBridge {
     private final Class<?> entityHitResultClass;
     private final Class<?> vec3Class;
     private final Class<?> blockPosClass;
+    private final Class<?> directionClass;
+    private final Class<?> interactionHandClass;
     private final Class<?> playerInfoClass;
     private final Class<?> clientLevelClass;
     private final Class<?> remotePlayerClass;
@@ -94,6 +97,8 @@ public final class MinecraftBridge {
     private final Method inventorySetSelectedSlotMethod;
     private final Method inventoryGetSelectedSlotMethod;
     private final Method gameModeSyncSelectedSlotMethod;
+    private final Method gameModeUseItemMethod;
+    private final Method gameModeUseItemOnMethod;
     private final Method guiGetChatMethod;
     private final Method componentGetStringMethod;
     private final Method componentLiteralMethod;
@@ -154,9 +159,15 @@ public final class MinecraftBridge {
     private final Method entitySetNoGravityMethod;
     private final Method entitySetInvisibleMethod;
     private final Method screenshotGrabMethod;
+    private final Method interactionResultConsumesActionMethod;
+    private final Method interactionResultShouldSwingMethod;
+    private final Method playerSwingMethod;
 
     private final Constructor<?> gameProfileConstructor;
     private final Constructor<?> remotePlayerConstructor;
+    private final Constructor<?> vec3Constructor;
+    private final Constructor<?> blockPosConstructor;
+    private final Constructor<?> blockHitResultConstructor;
 
     private final Field minecraftGameDirectoryField;
     private final Field minecraftOptionsField;
@@ -193,6 +204,14 @@ public final class MinecraftBridge {
     private final Field vec3ZField;
 
     private final Object entityDiscardedRemovalReason;
+    private final Object directionDown;
+    private final Object directionUp;
+    private final Object directionNorth;
+    private final Object directionSouth;
+    private final Object directionWest;
+    private final Object directionEast;
+    private final Object mainHand;
+    private final Object offHand;
 
     public MinecraftBridge() throws ReflectiveOperationException {
         minecraftClass = findClass("net.minecraft.client.Minecraft", "gfj");
@@ -267,6 +286,9 @@ public final class MinecraftBridge {
         inventorySetSelectedSlotMethod = findMethodAny(inventoryClass, new String[]{"setSelectedSlot", "d"}, int.class);
         inventoryGetSelectedSlotMethod = findMethodAny(inventoryClass, new String[]{"getSelectedSlot", "g"});
         gameModeSyncSelectedSlotMethod = findMethodAny(gameModeClass, new String[]{"ensureHasSentCarriedItem", "l"});
+        gameModeUseItemOnMethod = findGameModeUseItemOnMethod();
+        interactionHandClass = gameModeUseItemOnMethod.getParameterTypes()[1];
+        gameModeUseItemMethod = findMethodAny(gameModeClass, new String[]{"useItem", "a"}, localPlayerClass, interactionHandClass);
         guiGetChatMethod = findMethodAny(guiClass, new String[]{"getChat", "e"});
         componentGetStringMethod = findMethodAny(componentClass, new String[]{"getString"});
         componentLiteralMethod = findMethodAny(componentClass, new String[]{"literal", "b"}, String.class);
@@ -290,6 +312,7 @@ public final class MinecraftBridge {
         hitResultGetLocationMethod = findMethodAny(hitResultClass, new String[]{"getLocation", "g"});
         blockHitResultGetBlockPosMethod = findMethodAny(blockHitResultClass, new String[]{"getBlockPos", "b"});
         blockHitResultGetDirectionMethod = findMethodAny(blockHitResultClass, new String[]{"getDirection", "c"});
+        directionClass = blockHitResultGetDirectionMethod.getReturnType();
         entityHitResultGetEntityMethod = findMethodAny(entityHitResultClass, new String[]{"getEntity", "a"});
         blockPosAsLongMethod = findMethodAny(blockPosClass, new String[]{"asLong", "a"});
         blockPosGetXMethod = findMethodAny(blockPosClass, new String[]{"getX", "a"}, long.class);
@@ -326,7 +349,10 @@ public final class MinecraftBridge {
         entitySetCustomNameVisibleMethod = findMethodAny(entityClass, new String[]{"setCustomNameVisible", "p"}, boolean.class);
         entitySetNoGravityMethod = findMethodAny(entityClass, new String[]{"setNoGravity", "g"}, boolean.class);
         entitySetInvisibleMethod = findMethodAny(entityClass, new String[]{"setInvisible", "l"}, boolean.class);
+        playerSwingMethod = findMethodAny(playerClass, new String[]{"swing", "a"}, interactionHandClass);
         screenshotGrabMethod = findMethodAny(screenshotClass, new String[]{"grab", "a"}, File.class, String.class, renderTargetClass, int.class, Consumer.class);
+        interactionResultConsumesActionMethod = findMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"consumesAction", "a"});
+        interactionResultShouldSwingMethod = findMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"shouldSwing", "b"});
 
         localPlayerConnectionField = findFieldAny(localPlayerClass, "connection", "b");
         playerInventoryField = findFieldAny(playerClass, "inventory", "cE");
@@ -356,7 +382,21 @@ public final class MinecraftBridge {
         gameProfileConstructor.setAccessible(true);
         remotePlayerConstructor = remotePlayerClass.getDeclaredConstructor(clientLevelClass, gameProfileClass);
         remotePlayerConstructor.setAccessible(true);
+        vec3Constructor = vec3Class.getDeclaredConstructor(double.class, double.class, double.class);
+        vec3Constructor.setAccessible(true);
+        blockPosConstructor = blockPosClass.getDeclaredConstructor(int.class, int.class, int.class);
+        blockPosConstructor.setAccessible(true);
+        blockHitResultConstructor = blockHitResultClass.getDeclaredConstructor(vec3Class, directionClass, blockPosClass, boolean.class);
+        blockHitResultConstructor.setAccessible(true);
         entityDiscardedRemovalReason = findFieldAny(entityRemovalReasonClass, "DISCARDED", "b").get(null);
+        directionDown = findFieldAny(directionClass, "DOWN", "a").get(null);
+        directionUp = findFieldAny(directionClass, "UP", "b").get(null);
+        directionNorth = findFieldAny(directionClass, "NORTH", "c").get(null);
+        directionSouth = findFieldAny(directionClass, "SOUTH", "d").get(null);
+        directionWest = findFieldAny(directionClass, "WEST", "e").get(null);
+        directionEast = findFieldAny(directionClass, "EAST", "f").get(null);
+        mainHand = findFieldAny(interactionHandClass, "MAIN_HAND", "a").get(null);
+        offHand = findFieldAny(interactionHandClass, "OFF_HAND", "b").get(null);
     }
 
     public Path getGameDirectory() throws ReflectiveOperationException {
@@ -418,6 +458,14 @@ public final class MinecraftBridge {
         });
     }
 
+    public Map<String, Object> getInventoryContents() throws ReflectiveOperationException {
+        return onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object player = minecraftPlayerField.get(minecraft);
+            return inventoryPayload(player);
+        });
+    }
+
     public Map<String, Object> getFullState(int chatLimit) throws ReflectiveOperationException {
         int safeChatLimit = Math.max(1, chatLimit);
         return onClientThread(() -> {
@@ -433,6 +481,7 @@ public final class MinecraftBridge {
             payload.put("target", crosshairTargetPayload(minecraft, player, screen, hitResult));
             payload.put("container", containerContentsPayload(screen));
             payload.put("players", playerListPayload(player));
+            payload.put("inventory", inventoryPayload(player));
             payload.put("chat", chatPayload(minecraft, -1L, safeChatLimit));
             return payload;
         });
@@ -584,6 +633,143 @@ public final class MinecraftBridge {
         payload.put("count", players.size());
         payload.put("players", players);
         return payload;
+    }
+
+    private Map<String, Object> inventoryPayload(Object player) throws ReflectiveOperationException {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("ok", Boolean.TRUE);
+        payload.put("inWorld", player != null);
+
+        if (player == null) {
+            payload.put("selectedHotbarSlot", 0);
+            payload.put("slotCount", 0);
+            payload.put("items", List.of());
+            payload.put("heldItem", itemStackSummary(null));
+            return payload;
+        }
+
+        Object inventory = playerInventoryField.get(player);
+        int selectedSlot = invokeInt(inventoryGetSelectedSlotMethod, inventory);
+        List<InventorySection> sections = inventorySections(inventory);
+        List<Map<String, Object>> items = new ArrayList<>();
+        Object heldItem = null;
+        int slotCount = 0;
+
+        for (InventorySection section : sections) {
+            List<?> stacks = section.stacks();
+            for (int index = 0; index < stacks.size(); index++) {
+                Object itemStack = stacks.get(index);
+                int slot = section.slotBase() + index;
+                slotCount = Math.max(slotCount, slot + 1);
+
+                if ("main".equals(section.name()) && index == selectedSlot) {
+                    heldItem = itemStack;
+                }
+
+                if (itemStack == null || (Boolean) itemStackIsEmptyMethod.invoke(itemStack)) {
+                    continue;
+                }
+
+                Map<String, Object> itemPayload = itemStackSummary(itemStack);
+                itemPayload.put("slot", slot);
+                itemPayload.put("section", section.name());
+                itemPayload.put("sectionIndex", index);
+                itemPayload.put("displayName", itemPayload.get("name"));
+                items.add(itemPayload);
+            }
+        }
+
+        items.sort(Comparator.comparingInt(entry -> ((Number) entry.get("slot")).intValue()));
+        payload.put("selectedHotbarSlot", selectedSlot + 1);
+        payload.put("slotCount", slotCount);
+        payload.put("items", items);
+        payload.put("heldItem", itemStackSummary(heldItem));
+        return payload;
+    }
+
+    private List<InventorySection> inventorySections(Object inventory) throws IllegalAccessException {
+        List<List<?>> lists = new ArrayList<>();
+        for (Class<?> current = inventory.getClass(); current != null && current != Object.class; current = current.getSuperclass()) {
+            for (Field field : current.getDeclaredFields()) {
+                if (Modifier.isStatic(field.getModifiers()) || !List.class.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+
+                field.setAccessible(true);
+                Object value = field.get(inventory);
+                if (!(value instanceof List<?> list) || !looksLikeItemStackList(list)) {
+                    continue;
+                }
+
+                boolean duplicate = false;
+                for (List<?> existing : lists) {
+                    if (existing == list) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    lists.add(list);
+                }
+            }
+        }
+
+        lists.sort(Comparator.comparingInt((List<?> entry) -> entry.size()).reversed());
+
+        List<InventorySection> sections = new ArrayList<>();
+        int fallbackIndex = 1;
+        for (List<?> list : lists) {
+            String name;
+            int slotBase;
+            if (list.size() == 36) {
+                name = "main";
+                slotBase = 0;
+            } else if (list.size() == 4) {
+                name = "armor";
+                slotBase = 36;
+            } else if (list.size() == 1) {
+                name = "offhand";
+                slotBase = 40;
+            } else {
+                name = "section" + fallbackIndex;
+                slotBase = nextInventorySlotBase(sections);
+                fallbackIndex += 1;
+            }
+            sections.add(new InventorySection(name, slotBase, list));
+        }
+
+        sections.sort(Comparator.comparingInt(InventorySection::slotBase));
+        return sections;
+    }
+
+    private boolean looksLikeItemStackList(List<?> list) {
+        if (list.isEmpty()) {
+            return false;
+        }
+
+        int checked = 0;
+        for (Object entry : list) {
+            if (entry == null) {
+                continue;
+            }
+            if (!itemStackClass.isInstance(entry)) {
+                return false;
+            }
+            checked += 1;
+            if (checked >= 4) {
+                return true;
+            }
+        }
+
+        return checked > 0;
+    }
+
+    private static int nextInventorySlotBase(List<InventorySection> sections) {
+        int slotBase = 0;
+        for (InventorySection section : sections) {
+            slotBase = Math.max(slotBase, section.slotBase() + section.stacks().size());
+        }
+        return slotBase;
     }
 
     public Map<String, Object> takeScreenshot(String requestedName) throws ReflectiveOperationException {
@@ -940,6 +1126,93 @@ public final class MinecraftBridge {
             Object player = requirePlayer();
             applyHotbarSlot(minecraft, player, selectedSlot);
             return null;
+        });
+    }
+
+    public Map<String, Object> interactItem(String handName) throws ReflectiveOperationException {
+        String normalizedHand = normalizeHandName(handName);
+        return onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object player = requirePlayer();
+            Object gameMode = minecraftGameModeField.get(minecraft);
+            if (gameMode == null) {
+                throw new IllegalStateException("game mode is not available");
+            }
+
+            Object hand = resolveInteractionHand(normalizedHand);
+            Object result = gameModeUseItemMethod.invoke(gameMode, player, hand);
+            boolean consumesAction = (Boolean) interactionResultConsumesActionMethod.invoke(result);
+            boolean shouldSwing = (Boolean) interactionResultShouldSwingMethod.invoke(result);
+            if (shouldSwing) {
+                playerSwingMethod.invoke(player, hand);
+            }
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("ok", Boolean.TRUE);
+            payload.put("hand", normalizedHand);
+            payload.put("result", String.valueOf(result));
+            payload.put("consumesAction", consumesAction);
+            payload.put("shouldSwing", shouldSwing);
+            return payload;
+        });
+    }
+
+    public Map<String, Object> interactBlock(
+        int x,
+        int y,
+        int z,
+        String faceName,
+        Double hitX,
+        Double hitY,
+        Double hitZ,
+        Boolean insideBlock,
+        String handName
+    ) throws ReflectiveOperationException {
+        String normalizedFace = normalizeDirectionName(faceName);
+        String normalizedHand = normalizeHandName(handName);
+        boolean inside = insideBlock != null && insideBlock;
+        return onClientThread(() -> {
+            Object minecraft = getMinecraft();
+            Object player = requirePlayer();
+            Object gameMode = minecraftGameModeField.get(minecraft);
+            if (gameMode == null) {
+                throw new IllegalStateException("game mode is not available");
+            }
+
+            Object hand = resolveInteractionHand(normalizedHand);
+            Object direction = resolveDirection(normalizedFace);
+            double[] hit = resolveHitLocation(x, y, z, normalizedFace, hitX, hitY, hitZ);
+            Object blockPos = blockPosConstructor.newInstance(x, y, z);
+            Object location = vec3Constructor.newInstance(hit[0], hit[1], hit[2]);
+            Object blockHitResult = blockHitResultConstructor.newInstance(location, direction, blockPos, inside);
+            Object result = gameModeUseItemOnMethod.invoke(gameMode, player, hand, blockHitResult);
+            boolean consumesAction = (Boolean) interactionResultConsumesActionMethod.invoke(result);
+            boolean shouldSwing = (Boolean) interactionResultShouldSwingMethod.invoke(result);
+            if (shouldSwing) {
+                playerSwingMethod.invoke(player, hand);
+            }
+
+            Map<String, Object> hitPayload = new LinkedHashMap<>();
+            hitPayload.put("x", hit[0]);
+            hitPayload.put("y", hit[1]);
+            hitPayload.put("z", hit[2]);
+
+            Map<String, Object> blockPayload = new LinkedHashMap<>();
+            blockPayload.put("x", x);
+            blockPayload.put("y", y);
+            blockPayload.put("z", z);
+            blockPayload.put("face", normalizedFace);
+            blockPayload.put("insideBlock", inside);
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("ok", Boolean.TRUE);
+            payload.put("hand", normalizedHand);
+            payload.put("result", String.valueOf(result));
+            payload.put("consumesAction", consumesAction);
+            payload.put("shouldSwing", shouldSwing);
+            payload.put("block", blockPayload);
+            payload.put("hit", hitPayload);
+            return payload;
         });
     }
 
@@ -1353,6 +1626,44 @@ public final class MinecraftBridge {
         return payload;
     }
 
+    private Object resolveInteractionHand(String handName) {
+        return switch (normalizeHandName(handName)) {
+            case "off" -> offHand;
+            default -> mainHand;
+        };
+    }
+
+    private Object resolveDirection(String faceName) {
+        return switch (normalizeDirectionName(faceName)) {
+            case "down" -> directionDown;
+            case "north" -> directionNorth;
+            case "south" -> directionSouth;
+            case "west" -> directionWest;
+            case "east" -> directionEast;
+            default -> directionUp;
+        };
+    }
+
+    private double[] resolveHitLocation(int x, int y, int z, String faceName, Double hitX, Double hitY, Double hitZ) {
+        double resolvedX = hitX != null ? hitX : x + 0.5D;
+        double resolvedY = hitY != null ? hitY : y + 0.5D;
+        double resolvedZ = hitZ != null ? hitZ : z + 0.5D;
+        if (hitX != null && hitY != null && hitZ != null) {
+            return new double[] { resolvedX, resolvedY, resolvedZ };
+        }
+
+        switch (normalizeDirectionName(faceName)) {
+            case "down" -> resolvedY = y + 0.001D;
+            case "north" -> resolvedZ = z + 0.001D;
+            case "south" -> resolvedZ = z + 0.999D;
+            case "west" -> resolvedX = x + 0.001D;
+            case "east" -> resolvedX = x + 0.999D;
+            default -> resolvedY = y + 0.999D;
+        }
+
+        return new double[] { resolvedX, resolvedY, resolvedZ };
+    }
+
     private Object resolveKeyMapping(Object options, String keyName) throws ReflectiveOperationException {
         Field field = findFieldAny(optionsClass, optionKeyFieldNames(keyName));
         return field.get(options);
@@ -1434,6 +1745,32 @@ public final class MinecraftBridge {
             throw new IllegalArgumentException("name must be at most 32 characters");
         }
         return normalized;
+    }
+
+    private static String normalizeHandName(String handName) {
+        if (handName == null || handName.isBlank()) {
+            return "main";
+        }
+        return switch (handName.strip().toLowerCase(Locale.ROOT)) {
+            case "main", "main_hand", "main-hand", "right" -> "main";
+            case "off", "off_hand", "off-hand", "left" -> "off";
+            default -> throw new IllegalArgumentException("unsupported hand: " + handName);
+        };
+    }
+
+    private static String normalizeDirectionName(String faceName) {
+        if (faceName == null || faceName.isBlank()) {
+            return "up";
+        }
+        return switch (faceName.strip().toLowerCase(Locale.ROOT)) {
+            case "up", "top" -> "up";
+            case "down", "bottom" -> "down";
+            case "north", "n" -> "north";
+            case "south", "s" -> "south";
+            case "west", "w" -> "west";
+            case "east", "e" -> "east";
+            default -> throw new IllegalArgumentException("unsupported face: " + faceName);
+        };
     }
 
     private static String normalizeScreenshotName(String requestedName) {
@@ -1533,6 +1870,42 @@ public final class MinecraftBridge {
         throw last != null ? last : new NoSuchMethodException(owner.getName());
     }
 
+    private Method findGameModeUseItemOnMethod() throws ReflectiveOperationException {
+        for (Method method : gameModeClass.getMethods()) {
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            if (parameterTypes.length != 3) {
+                continue;
+            }
+            if (parameterTypes[0] != localPlayerClass || parameterTypes[2] != blockHitResultClass) {
+                continue;
+            }
+            String name = method.getName();
+            if (!"useItemOn".equals(name) && !"a".equals(name)) {
+                continue;
+            }
+            method.setAccessible(true);
+            return method;
+        }
+
+        for (Method method : gameModeClass.getDeclaredMethods()) {
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            if (parameterTypes.length != 3) {
+                continue;
+            }
+            if (parameterTypes[0] != localPlayerClass || parameterTypes[2] != blockHitResultClass) {
+                continue;
+            }
+            String name = method.getName();
+            if (!"useItemOn".equals(name) && !"a".equals(name)) {
+                continue;
+            }
+            method.setAccessible(true);
+            return method;
+        }
+
+        throw new NoSuchMethodException(gameModeClass.getName() + "#useItemOn");
+    }
+
     private static Method findOptionalMethodAny(Class<?> owner, String[] names, Class<?>... parameterTypes) {
         try {
             return findMethodAny(owner, names, parameterTypes);
@@ -1562,6 +1935,9 @@ public final class MinecraftBridge {
     @FunctionalInterface
     private interface ReflectiveCallable<T> {
         T call() throws Exception;
+    }
+
+    private record InventorySection(String name, int slotBase, List<?> stacks) {
     }
 
     private record DebugFakePlayer(String name, UUID uuid, int entityId) {

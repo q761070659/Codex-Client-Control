@@ -6,7 +6,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js"
+    "check": "node --check src/server.js && node --check src/mod-client.js && node --check src/world-memory.js && node --check src/action-manager.js && node --check src/agent-runtime.js && node --check src/realtime-hub.js && node --check src/config.js"
   },
   "dependencies": {
     "minecraft-protocol": "^1.62.0",

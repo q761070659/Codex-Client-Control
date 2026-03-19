@@ -148,6 +148,9 @@ public final class ControlHttpServer {
             if ("GET".equalsIgnoreCase(request.method()) && "/players".equals(request.path())) {
                 return jsonResponse(200, bridge.getPlayerList());
             }
+            if ("GET".equalsIgnoreCase(request.method()) && "/inventory".equals(request.path())) {
+                return jsonResponse(200, bridge.getInventoryContents());
+            }
             if ("GET".equalsIgnoreCase(request.method()) && "/debug/fake-player".equals(request.path())) {
                 return jsonResponse(200, bridge.listDebugFakePlayers());
             }
@@ -210,6 +213,22 @@ public final class ControlHttpServer {
             if ("POST".equalsIgnoreCase(request.method()) && "/hotbar".equals(request.path())) {
                 bridge.setHotbarSlot(intValue(body, "slot", -1));
                 return jsonResponse(200, okPayload("updated"));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/interact/item".equals(request.path())) {
+                return jsonResponse(200, bridge.interactItem(optionalStringValue(body, "hand", "main")));
+            }
+            if ("POST".equalsIgnoreCase(request.method()) && "/interact/block".equals(request.path())) {
+                return jsonResponse(200, bridge.interactBlock(
+                    requiredIntValue(body, "x"),
+                    requiredIntValue(body, "y"),
+                    requiredIntValue(body, "z"),
+                    optionalStringValue(body, "face", "up"),
+                    doubleObjectValue(body, "hitX"),
+                    doubleObjectValue(body, "hitY"),
+                    doubleObjectValue(body, "hitZ"),
+                    booleanObjectValue(body, "insideBlock"),
+                    optionalStringValue(body, "hand", "main")
+                ));
             }
             if ("POST".equalsIgnoreCase(request.method()) && "/release-all".equals(request.path())) {
                 bridge.releaseAllMovementKeys();
@@ -459,6 +478,18 @@ public final class ControlHttpServer {
             case "input" -> webSocketInput(session, outputStream, body, respond);
             case "tap" -> webSocketTap(body);
             case "hotbar" -> webSocketHotbar(body);
+            case "interact.item" -> bridge.interactItem(optionalStringValue(body, "hand", "main"));
+            case "interact.block" -> bridge.interactBlock(
+                requiredIntValue(body, "x"),
+                requiredIntValue(body, "y"),
+                requiredIntValue(body, "z"),
+                optionalStringValue(body, "face", "up"),
+                doubleObjectValue(body, "hitX"),
+                doubleObjectValue(body, "hitY"),
+                doubleObjectValue(body, "hitZ"),
+                booleanObjectValue(body, "insideBlock"),
+                optionalStringValue(body, "hand", "main")
+            );
             case "release-all" -> webSocketReleaseAll();
             case "gui.close" -> webSocketGuiClose();
             case "gui.click" -> webSocketGuiClick(body);
@@ -786,6 +817,8 @@ public final class ControlHttpServer {
             case "input" -> inputStep(index, step);
             case "tap" -> tapStep(index, step);
             case "hotbar" -> hotbarStep(index, step);
+            case "interact.item" -> interactItemStep(index, step);
+            case "interact.block" -> interactBlockStep(index, step);
             case "chat" -> chatStep(index, step);
             case "command" -> commandStep(index, step);
             case "release-all", "releaseAll" -> releaseAllStep(index);
@@ -853,6 +886,28 @@ public final class ControlHttpServer {
     private Map<String, Object> hotbarStep(int index, JsonObject step) throws Exception {
         bridge.setHotbarSlot(requiredIntValue(step, "slot"));
         return stepPayload(index, "hotbar");
+    }
+
+    private Map<String, Object> interactItemStep(int index, JsonObject step) throws Exception {
+        Map<String, Object> payload = stepPayload(index, "interact.item");
+        payload.put("result", bridge.interactItem(optionalStringValue(step, "hand", "main")));
+        return payload;
+    }
+
+    private Map<String, Object> interactBlockStep(int index, JsonObject step) throws Exception {
+        Map<String, Object> payload = stepPayload(index, "interact.block");
+        payload.put("result", bridge.interactBlock(
+            requiredIntValue(step, "x"),
+            requiredIntValue(step, "y"),
+            requiredIntValue(step, "z"),
+            optionalStringValue(step, "face", "up"),
+            doubleObjectValue(step, "hitX"),
+            doubleObjectValue(step, "hitY"),
+            doubleObjectValue(step, "hitZ"),
+            booleanObjectValue(step, "insideBlock"),
+            optionalStringValue(step, "hand", "main")
+        ));
+        return payload;
     }
 
     private Map<String, Object> chatStep(int index, JsonObject step) throws Exception {
@@ -1011,6 +1066,14 @@ public final class ControlHttpServer {
             return null;
         }
         return body.get(key).getAsString();
+    }
+
+    private static String optionalStringValue(JsonObject body, String key, String fallback) {
+        String value = optionalStringValue(body, key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        return value;
     }
 
     private static boolean booleanValue(JsonObject body, String key, boolean fallback) {
@@ -1195,6 +1258,8 @@ public final class ControlHttpServer {
             case "fullState" -> "full-state";
             case "releaseAll" -> "release-all";
             case "gui.clickWidget" -> "gui.click-widget";
+            case "interactItem" -> "interact.item";
+            case "interactBlock" -> "interact.block";
             case "debug.fake-player.list" -> "debug.fake-player.list";
             default -> normalized;
         };
@@ -1202,7 +1267,7 @@ public final class ControlHttpServer {
 
     private static boolean shouldRespondToWebSocketAction(String action, JsonObject body) {
         return switch (action) {
-            case "status", "full-state", "chat.read", "screen", "target", "container", "players", "debug.fake-player", "debug.fake-player.list", "screenshot", "sequence", "subscribe", "unsubscribe", "subscriptions", "action.status", "action.run", "action.cancel", "ping" -> true;
+            case "status", "full-state", "chat.read", "screen", "target", "container", "players", "debug.fake-player", "debug.fake-player.list", "screenshot", "sequence", "subscribe", "unsubscribe", "subscriptions", "action.status", "action.run", "action.cancel", "interact.item", "interact.block", "ping" -> true;
             case "chat" -> !body.has("message");
             default -> false;
         };
@@ -1283,6 +1348,7 @@ public final class ControlHttpServer {
             "GET /target",
             "GET /container",
             "GET /players",
+            "GET /inventory",
             "GET /debug/fake-player",
             "GET /action/status",
             "WS /ws",
@@ -1293,6 +1359,8 @@ public final class ControlHttpServer {
             "POST /input",
             "POST /tap",
             "POST /hotbar",
+            "POST /interact/item",
+            "POST /interact/block",
             "POST /release-all",
             "POST /gui/close",
             "POST /gui/click",

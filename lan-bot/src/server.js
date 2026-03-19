@@ -1,5 +1,4 @@
 "use strict";
-
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
@@ -8,34 +7,67 @@ const { URL } = require("url");
 const mineflayer = require("mineflayer");
 const mc = require("minecraft-protocol");
 const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
+const prismarineItem = require("prismarine-item");
 const vec3Module = require("vec3");
 
 const ChatHistory = require("./chat-history");
 const ActionManager = require("./action-manager");
+const AgentRuntime = require("./agent-runtime");
+const { createModClient, resolveModClientOptions } = require("./mod-client");
+const RealtimeHub = require("./realtime-hub");
+const WorldMemory = require("./world-memory");
 const { loadConfig, saveConfig } = require("./config");
 
 const Vec3 = typeof vec3Module === "function" ? vec3Module : vec3Module.Vec3;
 const AIR_BLOCKS = new Set(["air", "cave_air", "void_air"]);
 
+function createEmptyModCache() {
+  return {
+    status: null,
+    players: null,
+    inventory: null,
+    fullState: null,
+    chat: null,
+    screen: null,
+    target: null,
+    container: null,
+    fakePlayers: null
+  };
+}
+
 const loaded = loadConfig(process.cwd());
 const rootDir = loaded.rootDir;
 const configPath = loaded.configPath;
 const config = loaded.config;
+const memoryPath = path.join(path.dirname(configPath), "codex-lan-memory.json");
+const agentPath = path.join(path.dirname(configPath), "codex-lan-agent.json");
 
 const chatHistory = new ChatHistory();
 const actionManager = new ActionManager();
+const worldMemory = new WorldMemory(memoryPath);
+const agentRuntime = new AgentRuntime(agentPath, config.agent || {});
+let realtimeHub = null;
 
 const state = {
+  driver: "none",
   bot: null,
+  modClient: null,
+  modCache: createEmptyModCache(),
   botOptions: null,
   connected: false,
   connecting: false,
   spawned: false,
+  telemetryInterval: null,
   lastError: "",
   lastDisconnect: ""
 };
 
 actionManager.setCancelHook(() => {
+  if (isModClientDriver() && state.modClient) {
+    state.modClient.releaseAll().catch(() => {
+      // ignore
+    });
+  }
   if (state.bot && state.bot.pathfinder) {
     try {
       state.bot.pathfinder.stop();
@@ -45,8 +77,395 @@ actionManager.setCancelHook(() => {
   }
 });
 
+actionManager.subscribe((snapshot) => {
+  worldMemory.setLastAction(snapshot);
+  if (realtimeHub) {
+    realtimeHub.broadcast("action", snapshot);
+  }
+});
+
+worldMemory.subscribe((event) => {
+  if (realtimeHub) {
+    realtimeHub.broadcast("memory", event);
+  }
+});
+
+agentRuntime.subscribe((event) => {
+  if (realtimeHub) {
+    realtimeHub.broadcast("agent", event);
+  }
+});
+
+const DIRECT_COMMAND_SPECS = {
+  read_status: {
+    description: "Read bot status, position, health and mode.",
+    args: {}
+  },
+  read_full_state: {
+    description: "Read status, players, inventory, chat, action and memory.",
+    args: {}
+  },
+  read_inventory: {
+    description: "Read current inventory items and held item.",
+    args: {}
+  },
+  read_players: {
+    description: "Read the current player list.",
+    args: {}
+  },
+  read_block: {
+    description: "Read a single block at coordinates.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number"
+    }
+  },
+  read_target: {
+    description: "Read current crosshair block/entity target.",
+    args: {
+      maxDistance: "number, default 6"
+    }
+  },
+  read_screen: {
+    description: "Read the current GUI screen snapshot and visible widgets.",
+    args: {}
+  },
+  read_container: {
+    description: "Open and inspect a container, or read the currently open GUI container.",
+    args: {
+      x: "number, optional",
+      y: "number, optional",
+      z: "number, optional",
+      range: "number, default 4",
+      face: "string, default up"
+    }
+  },
+  read_furnace: {
+    description: "Open and inspect a furnace.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      range: "number, default 4"
+    }
+  },
+  read_memory: {
+    description: "Read persistent world memory and session memory.",
+    args: {}
+  },
+  chat: {
+    description: "Send chat text.",
+    args: {
+      message: "string"
+    }
+  },
+  hotbar: {
+    description: "Select hotbar slot 1-9.",
+    args: {
+      slot: "number"
+    }
+  },
+  equip: {
+    description: "Equip an item by name, or select slot.",
+    args: {
+      item: "string",
+      slot: "number, optional"
+    }
+  },
+  move_to: {
+    description: "Walk to coordinates with pathfinder.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      range: "number, default 1"
+    }
+  },
+  look_at: {
+    description: "Rotate camera toward coordinates.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      force: "boolean, default true"
+    }
+  },
+  use_item: {
+    description: "Use held item, or interact with target block.",
+    args: {
+      x: "number, optional",
+      y: "number, optional",
+      z: "number, optional",
+      face: "string, optional",
+      hand: "string, default main",
+      hitX: "number, optional",
+      hitY: "number, optional",
+      hitZ: "number, optional",
+      insideBlock: "boolean, optional",
+      range: "number, default 4"
+    }
+  },
+  interact_block: {
+    description: "Use held item on a specific block through the native client interaction chain.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      face: "string, default up",
+      hand: "string, default main",
+      hitX: "number, optional",
+      hitY: "number, optional",
+      hitZ: "number, optional",
+      insideBlock: "boolean, optional"
+    }
+  },
+  set_input: {
+    description: "Set native input state on the mod-client backend.",
+    args: {
+      keys: "object, optional",
+      clearMovement: "boolean, default false",
+      yaw: "number, optional",
+      pitch: "number, optional",
+      deltaYaw: "number, optional",
+      deltaPitch: "number, optional",
+      hotbar: "number, optional"
+    }
+  },
+  tap_key: {
+    description: "Tap a movement or action key on the mod-client backend.",
+    args: {
+      key: "string",
+      durationMs: "number, default 120"
+    }
+  },
+  release_all: {
+    description: "Release all currently held native movement keys.",
+    args: {}
+  },
+  gui_click: {
+    description: "Click the current GUI at screen coordinates.",
+    args: {
+      x: "number",
+      y: "number",
+      button: "number, default 0",
+      doubleClick: "boolean, default false"
+    }
+  },
+  gui_release: {
+    description: "Release a pressed GUI mouse button.",
+    args: {
+      x: "number",
+      y: "number",
+      button: "number, default 0"
+    }
+  },
+  gui_scroll: {
+    description: "Scroll within the current GUI.",
+    args: {
+      x: "number",
+      y: "number",
+      deltaX: "number, default 0",
+      deltaY: "number, default 0"
+    }
+  },
+  gui_key: {
+    description: "Send a GUI key press.",
+    args: {
+      key: "number",
+      scancode: "number, default 0",
+      modifiers: "number, default 0"
+    }
+  },
+  gui_type: {
+    description: "Type text into the current GUI.",
+    args: {
+      text: "string"
+    }
+  },
+  gui_click_widget: {
+    description: "Click a widget by visible index on the current GUI screen.",
+    args: {
+      index: "number",
+      button: "number, default 0"
+    }
+  },
+  gui_close: {
+    description: "Close the current GUI screen.",
+    args: {}
+  },
+  screenshot: {
+    description: "Save a client screenshot and return the saved path.",
+    args: {
+      name: "string, optional"
+    }
+  },
+  debug_fake_player_list: {
+    description: "List debug fake players managed by the mod-client backend.",
+    args: {}
+  },
+  debug_fake_player_spawn: {
+    description: "Spawn a local debug fake player on the mod-client backend.",
+    args: {
+      name: "string",
+      x: "number, optional",
+      y: "number, optional",
+      z: "number, optional",
+      yaw: "number, optional",
+      pitch: "number, optional",
+      invisible: "boolean, optional",
+      noGravity: "boolean, optional",
+      nameVisible: "boolean, optional"
+    }
+  },
+  debug_fake_player_move: {
+    description: "Move an existing local debug fake player on the mod-client backend.",
+    args: {
+      name: "string",
+      x: "number, optional",
+      y: "number, optional",
+      z: "number, optional",
+      yaw: "number, optional",
+      pitch: "number, optional",
+      invisible: "boolean, optional",
+      noGravity: "boolean, optional",
+      nameVisible: "boolean, optional"
+    }
+  },
+  debug_fake_player_remove: {
+    description: "Remove a local debug fake player from the mod-client backend.",
+    args: {
+      name: "string"
+    }
+  },
+  place: {
+    description: "Hand place one block.",
+    args: {
+      item: "string",
+      x: "number",
+      y: "number",
+      z: "number",
+      range: "number, default 4",
+      replace: "boolean, default false"
+    }
+  },
+  place_water: {
+    description: "Place water by bucket onto a block face.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      item: "string, default water_bucket",
+      range: "number, default 4"
+    }
+  },
+  dig: {
+    description: "Dig a block by hand.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      range: "number, default 4"
+    }
+  },
+  clear_block: {
+    description: "Dig only when target is occupied.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      range: "number, default 4"
+    }
+  },
+  container_deposit: {
+    description: "Store items into container.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      item: "string",
+      count: "number"
+    }
+  },
+  container_withdraw: {
+    description: "Take items from container.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      item: "string",
+      count: "number"
+    }
+  },
+  smelt_item: {
+    description: "Put input and fuel into furnace and take cooked output.",
+    args: {
+      x: "number",
+      y: "number",
+      z: "number",
+      inputItem: "string",
+      inputCount: "number, default 1",
+      fuelItem: "string, default coal",
+      fuelCount: "number, default 1",
+      outputItem: "string, optional"
+    }
+  },
+  consume: {
+    description: "Eat held or named food item.",
+    args: {
+      item: "string, optional"
+    }
+  },
+  fish_until: {
+    description: "Fish until a cookable fish is caught or attempts run out.",
+    args: {
+      x: "number, optional",
+      y: "number, optional",
+      z: "number, optional",
+      lookX: "number, optional",
+      lookY: "number, optional",
+      lookZ: "number, optional",
+      fishAttempts: "number, default 8"
+    }
+  },
+  wait: {
+    description: "Pause execution.",
+    args: {
+      milliseconds: "number",
+      seconds: "number, optional"
+    }
+  },
+  memory_note: {
+    description: "Store a text note in persistent memory.",
+    args: {
+      text: "string",
+      tag: "string, optional"
+    }
+  },
+  memory_waypoint: {
+    description: "Store a named coordinate.",
+    args: {
+      name: "string",
+      x: "number",
+      y: "number",
+      z: "number",
+      note: "string, optional"
+    }
+  },
+  memory_context: {
+    description: "Update the agent task context with arbitrary fields.",
+    args: {
+      patch: "object or key/value"
+    }
+  }
+};
+
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function nowIso() {
@@ -55,6 +474,17 @@ function nowIso() {
 
 function logMessage(text, tag) {
   chatHistory.add(text, tag);
+  worldMemory.addObservation("log", {
+    tag,
+    text
+  });
+  if (realtimeHub) {
+    realtimeHub.broadcast(tag === "Chat" ? "chat" : "log", {
+      tag,
+      text,
+      time: nowIso()
+    });
+  }
   const line = "[" + nowIso() + "] [" + tag + "] " + text;
   if (tag === "Error") {
     console.error(line);
@@ -63,9 +493,581 @@ function logMessage(text, tag) {
   console.log(line);
 }
 
+function optionalStringValue(body, key, fallback) {
+  if (!body || !(key in body) || typeof body[key] === "undefined" || body[key] === null) {
+    return fallback;
+  }
+  if (typeof body[key] !== "string") {
+    throw new Error("invalid string field: " + key);
+  }
+  return body[key];
+}
+
+function roundNumber(value, digits) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Number(parsed.toFixed(digits));
+}
+
+function normalizeDriverName(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || raw === "auto") {
+    return "auto";
+  }
+  if (raw === "mod" || raw === "modclient" || raw === "mod_client" || raw === "client_mod") {
+    return "mod_client";
+  }
+  if (raw === "mineflayer" || raw === "lan" || raw === "lan_bot" || raw === "lan-bot") {
+    return "mineflayer";
+  }
+  throw new Error("unsupported driver: " + value);
+}
+
+function isMineflayerDriver() {
+  return state.driver === "mineflayer";
+}
+
+function isModClientDriver() {
+  return state.driver === "mod_client";
+}
+
+function isMineflayerReady() {
+  return Boolean(isMineflayerDriver() && state.bot && state.connected && state.spawned);
+}
+
+function isModClientConnected() {
+  return Boolean(isModClientDriver() && state.modClient && state.connected);
+}
+
+function resetModCache() {
+  state.modCache = createEmptyModCache();
+}
+
+function extractModClientOverrides(body) {
+  const overrides = body && body.modClient && typeof body.modClient === "object" && !Array.isArray(body.modClient)
+    ? { ...body.modClient }
+    : {};
+
+  for (const key of ["host", "port", "token", "configPath", "bootstrapLogPath"]) {
+    if (body && key in body) {
+      overrides[key] = body[key];
+    }
+  }
+
+  return overrides;
+}
+
+function modClientBotPayload(options) {
+  const safeOptions = options && typeof options === "object" ? options : {};
+  return {
+    username: safeOptions.username || "ModClient",
+    host: safeOptions.host || (config.modClient && config.modClient.host) || "127.0.0.1",
+    port: Number.isFinite(Number(safeOptions.port)) ? Number(safeOptions.port) : ((config.modClient && Number(config.modClient.port)) || 0),
+    auth: "local",
+    version: "native",
+    driver: "mod_client",
+    configPath: safeOptions.configPath || (config.modClient && config.modClient.configPath) || "",
+    bootstrapLogPath: safeOptions.bootstrapLogPath || (config.modClient && config.modClient.bootstrapLogPath) || ""
+  };
+}
+
+function defaultEmptyItemPayload() {
+  return {
+    empty: true,
+    name: "",
+    count: 0,
+    slot: -1,
+    displayName: ""
+  };
+}
+
+function normalizeModStatusPayload(remote) {
+  const payload = {
+    ok: true,
+    mode: "lan-bot",
+    driver: "mod_client",
+    connected: isModClientConnected(),
+    connecting: state.connecting,
+    bot: modClientBotPayload(state.botOptions),
+    action: actionManager.snapshot(),
+    memory: worldMemory.summary(),
+    agent: {
+      currentSessionId: agentRuntime.snapshot().currentSessionId || "",
+      llmConfigured: agentRuntime.llmConfigured(),
+      sessions: agentRuntime.listSessions().slice(0, 5)
+    }
+  };
+
+  if (state.lastError) {
+    payload.lastError = state.lastError;
+  }
+  if (state.lastDisconnect) {
+    payload.lastDisconnect = state.lastDisconnect;
+  }
+
+  const status = remote && typeof remote === "object" ? remote : {};
+  payload.inWorld = Boolean(status.inWorld);
+  if (status.screen) {
+    payload.screen = clone(status.screen);
+  }
+  if (payload.inWorld) {
+    payload.x = roundNumber(status.x, 2);
+    payload.y = roundNumber(status.y, 2);
+    payload.z = roundNumber(status.z, 2);
+    payload.yaw = roundNumber(status.yaw, 4);
+    payload.pitch = roundNumber(status.pitch, 4);
+    payload.health = roundNumber(status.health, 2);
+    payload.maxHealth = roundNumber(status.maxHealth, 2);
+    payload.food = Number.isFinite(Number(status.food)) ? Number(status.food) : 0;
+    payload.saturation = roundNumber(status.saturation, 2);
+  }
+  payload.selectedHotbarSlot = Number.isFinite(Number(status.selectedHotbarSlot))
+    ? Number(status.selectedHotbarSlot)
+    : 0;
+  payload.heldItem = state.modCache.inventory && state.modCache.inventory.heldItem
+    ? clone(state.modCache.inventory.heldItem)
+    : defaultEmptyItemPayload();
+  return payload;
+}
+
+function normalizeModPlayersPayload(remote) {
+  const rawPlayers = remote && Array.isArray(remote.players) ? remote.players : [];
+  const players = rawPlayers.map((player) => ({
+    name: player && player.name ? String(player.name) : "",
+    uuid: player && player.uuid ? String(player.uuid) : "",
+    displayName: player && player.displayName ? String(player.displayName) : "",
+    latency: player && Number.isFinite(Number(player.latency)) ? Number(player.latency) : 0,
+    ping: player && Number.isFinite(Number(player.latency)) ? Number(player.latency) : 0,
+    gameMode: player && player.gameMode ? String(player.gameMode) : "",
+    gamemode: player && player.gameMode ? String(player.gameMode) : ""
+  })).filter((player) => player.name);
+
+  return {
+    ok: true,
+    connected: isModClientConnected(),
+    inWorld: Boolean(remote && remote.inWorld),
+    count: players.length,
+    players
+  };
+}
+
+function normalizeModInventoryPayload(remote) {
+  const inventory = remote && typeof remote === "object" ? remote : {};
+  return {
+    ok: true,
+    connected: isModClientConnected(),
+    inWorld: Boolean(inventory.inWorld),
+    selectedHotbarSlot: Number.isFinite(Number(inventory.selectedHotbarSlot))
+      ? Number(inventory.selectedHotbarSlot)
+      : 0,
+    items: Array.isArray(inventory.items) ? clone(inventory.items) : [],
+    heldItem: inventory.heldItem ? clone(inventory.heldItem) : defaultEmptyItemPayload(),
+    slotCount: Number.isFinite(Number(inventory.slotCount)) ? Number(inventory.slotCount) : 0
+  };
+}
+
+function normalizeModTargetPayload(remote, maxDistance) {
+  if (!remote || typeof remote !== "object") {
+    return {
+      ok: true,
+      connected: isModClientConnected(),
+      target: null
+    };
+  }
+
+  let block = null;
+  if (remote.block && remote.block.position) {
+    const position = remote.block.position;
+    block = {
+      x: Number(position.x),
+      y: Number(position.y),
+      z: Number(position.z),
+      position: clone(position),
+      direction: remote.block.direction || ""
+    };
+  }
+
+  let entity = null;
+  if (remote.entity) {
+    entity = {
+      id: Number.isFinite(Number(remote.entity.id)) ? Number(remote.entity.id) : 0,
+      uuid: remote.entity.uuid ? String(remote.entity.uuid) : "",
+      name: remote.entity.name ? String(remote.entity.name) : "",
+      className: remote.entity.className ? String(remote.entity.className) : "",
+      x: roundNumber(remote.entity.x, 2),
+      y: roundNumber(remote.entity.y, 2),
+      z: roundNumber(remote.entity.z, 2),
+      yaw: roundNumber(remote.entity.yaw, 4),
+      pitch: roundNumber(remote.entity.pitch, 4)
+    };
+  }
+
+  return {
+    ok: true,
+    connected: isModClientConnected(),
+    target: {
+      maxDistance: Number.isFinite(Number(maxDistance)) ? Number(maxDistance) : 6,
+      type: remote.type ? String(remote.type) : "",
+      hit: Boolean(remote.hit),
+      screen: remote.screen ? clone(remote.screen) : null,
+      location: remote.location ? clone(remote.location) : null,
+      block,
+      entity
+    }
+  };
+}
+
+function normalizeModScreenPayload(remote) {
+  if (!remote || typeof remote !== "object") {
+    return {
+      ok: true,
+      connected: isModClientConnected(),
+      open: false,
+      widgets: []
+    };
+  }
+
+  const payload = clone(remote);
+  payload.connected = isModClientConnected();
+  return payload;
+}
+
+function normalizeModContainerPayload(remote) {
+  if (!remote || typeof remote !== "object") {
+    return {
+      ok: true,
+      connected: isModClientConnected(),
+      containerOpen: false,
+      slotCount: 0,
+      slots: [],
+      carried: defaultEmptyItemPayload()
+    };
+  }
+
+  const payload = clone(remote);
+  payload.connected = isModClientConnected();
+  return payload;
+}
+
+function normalizeModFakePlayersPayload(remote) {
+  const payload = remote && typeof remote === "object" ? clone(remote) : {
+    ok: true,
+    players: [],
+    count: 0
+  };
+  payload.connected = isModClientConnected();
+  return payload;
+}
+
+function syncModCacheFromFullState(fullState) {
+  if (!fullState || typeof fullState !== "object") {
+    return;
+  }
+
+  state.modCache.fullState = clone(fullState);
+  if (fullState.status) {
+    state.modCache.status = clone(fullState.status);
+  }
+  if (fullState.players) {
+    state.modCache.players = clone(fullState.players);
+  }
+  if (fullState.inventory) {
+    state.modCache.inventory = clone(fullState.inventory);
+  }
+  if (fullState.chat) {
+    state.modCache.chat = clone(fullState.chat);
+  }
+  if (fullState.screen) {
+    state.modCache.screen = clone(fullState.screen);
+  }
+  if (fullState.target) {
+    state.modCache.target = clone(fullState.target);
+  }
+  if (fullState.container) {
+    state.modCache.container = clone(fullState.container);
+  }
+}
+
+function rememberModContainerObservation(containerPayload, position, source) {
+  if (!position || !containerPayload || !containerPayload.containerOpen || !Array.isArray(containerPayload.slots)) {
+    return;
+  }
+
+  const slots = containerPayload.slots
+    .filter((entry) => entry && entry.item && !entry.item.empty)
+    .map((entry) => ({
+      slot: Number.isFinite(Number(entry.index)) ? Number(entry.index) : -1,
+      name: entry.item.name || "",
+      count: Number.isFinite(Number(entry.item.count)) ? Number(entry.item.count) : 0,
+      displayName: entry.item.displayName || entry.item.name || ""
+    }))
+    .filter((entry) => entry.slot >= 0);
+
+  worldMemory.rememberContainer({
+    x: position.x,
+    y: position.y,
+    z: position.z,
+    name: "container",
+    title: containerPayload.className || "",
+    slots,
+    source
+  });
+}
+
+function requireModClient() {
+  if (!state.modClient || !isModClientDriver()) {
+    throw new Error("mod-client backend is not connected");
+  }
+  return state.modClient;
+}
+
+async function readStatusPayload() {
+  if (!isModClientDriver()) {
+    return getStatusPayload();
+  }
+
+  const remote = await requireModClient().status();
+  state.modCache.status = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return getStatusPayload();
+}
+
+async function readPlayersPayload() {
+  if (!isModClientDriver()) {
+    return getPlayersPayload();
+  }
+
+  const remote = await requireModClient().players();
+  state.modCache.players = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return getPlayersPayload();
+}
+
+async function readInventoryPayload() {
+  if (!isModClientDriver()) {
+    return getInventoryPayload();
+  }
+
+  const remote = await requireModClient().inventory();
+  state.modCache.inventory = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return getInventoryPayload();
+}
+
+async function readTargetPayload(maxDistance) {
+  if (!isModClientDriver()) {
+    return getTargetPayload(maxDistance);
+  }
+
+  const remote = await requireModClient().target({
+    maxDistance: Number.isFinite(Number(maxDistance)) ? Number(maxDistance) : 6
+  });
+  state.modCache.target = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return normalizeModTargetPayload(remote, maxDistance);
+}
+
+async function readScreenPayload() {
+  if (!isModClientDriver()) {
+    throw new Error("read_screen requires mod_client backend");
+  }
+
+  const remote = await requireModClient().screen();
+  state.modCache.screen = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return normalizeModScreenPayload(remote);
+}
+
+async function readContainerPayload() {
+  if (!isModClientDriver()) {
+    throw new Error("container GUI read requires mod_client backend");
+  }
+
+  const remote = await requireModClient().container();
+  state.modCache.container = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return normalizeModContainerPayload(remote);
+}
+
+async function readFakePlayersPayload() {
+  if (!isModClientDriver()) {
+    throw new Error("debug fake players require mod_client backend");
+  }
+
+  const remote = await requireModClient().listFakePlayers();
+  state.modCache.fakePlayers = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return normalizeModFakePlayersPayload(remote);
+}
+
+async function readFullStatePayload() {
+  if (!isModClientDriver()) {
+    return getFullStatePayload();
+  }
+
+  const remote = await requireModClient().fullState();
+  syncModCacheFromFullState(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+
+  return {
+    ok: true,
+    status: getStatusPayload(),
+    players: getPlayersPayload(),
+    inventory: getInventoryPayload(),
+    chat: state.modCache.chat ? clone(state.modCache.chat) : { ok: true, messages: [], typed: [] },
+    screen: normalizeModScreenPayload(state.modCache.screen),
+    target: normalizeModTargetPayload(state.modCache.target, 6),
+    container: normalizeModContainerPayload(state.modCache.container),
+    action: actionManager.snapshot(),
+    memory: worldMemory.snapshot(),
+    agent: agentRuntime.snapshot()
+  };
+}
+
+async function readChatPayload(since, limit) {
+  if (!isModClientDriver()) {
+    return chatHistory.get(since, limit);
+  }
+
+  const remote = await requireModClient().readChat({
+    since,
+    limit
+  });
+  state.modCache.chat = clone(remote);
+  state.connected = true;
+  state.spawned = true;
+  state.lastError = "";
+  return clone(remote);
+}
+
+async function readBlockPayload(x, y, z) {
+  if (!isModClientDriver()) {
+    return getBlockPayload(x, y, z);
+  }
+  throw new Error("read_block is not supported in mod_client backend yet");
+}
+
+function calculateLookAngles(origin, target) {
+  const eyeX = Number(origin.x || 0);
+  const eyeY = Number(origin.y || 0) + 1.62;
+  const eyeZ = Number(origin.z || 0);
+  const dx = Number(target.x) - eyeX;
+  const dy = Number(target.y) - eyeY;
+  const dz = Number(target.z) - eyeZ;
+  const horizontalDistance = Math.sqrt((dx * dx) + (dz * dz));
+
+  return {
+    yaw: Math.atan2(-dx, dz) * (180 / Math.PI),
+    pitch: Math.atan2(-dy, horizontalDistance) * (180 / Math.PI)
+  };
+}
+
+function blockPayloadFromBlock(block) {
+  if (!block) {
+    return null;
+  }
+
+  let properties = {};
+  if (typeof block.getProperties === "function") {
+    properties = block.getProperties() || {};
+  }
+
+  return {
+    x: block.position.x,
+    y: block.position.y,
+    z: block.position.z,
+    name: block.name,
+    displayName: block.displayName || block.name,
+    stateId: block.stateId,
+    type: block.type,
+    isAir: isAir(block),
+    properties
+  };
+}
+
+function updateMemorySnapshot() {
+  const status = getStatusPayload();
+  const players = getPlayersPayload();
+  worldMemory.setBotStatus(status);
+  worldMemory.setPlayers(players);
+  if (realtimeHub) {
+    realtimeHub.broadcast("status", status);
+    realtimeHub.broadcast("players", players);
+  }
+}
+
+async function refreshModTelemetry() {
+  if (!isModClientDriver() || !state.modClient) {
+    return;
+  }
+
+  try {
+    const [status, players] = await Promise.all([
+      state.modClient.status(),
+      state.modClient.players()
+    ]);
+    state.modCache.status = clone(status);
+    state.modCache.players = clone(players);
+    state.connected = true;
+    state.spawned = true;
+    state.lastError = "";
+    updateMemorySnapshot();
+  } catch (error) {
+    state.connected = false;
+    state.lastError = error && error.message ? error.message : String(error);
+  }
+}
+
+function stopTelemetryLoop() {
+  if (state.telemetryInterval) {
+    clearInterval(state.telemetryInterval);
+    state.telemetryInterval = null;
+  }
+}
+
+function startTelemetryLoop() {
+  stopTelemetryLoop();
+  if (isModClientDriver()) {
+    void refreshModTelemetry();
+    state.telemetryInterval = setInterval(() => {
+      void refreshModTelemetry();
+    }, 500);
+    return;
+  }
+  updateMemorySnapshot();
+  state.telemetryInterval = setInterval(() => {
+    try {
+      updateMemorySnapshot();
+    } catch (error) {
+      // ignore periodic telemetry errors
+    }
+  }, 1500);
+}
+
 function requireBot() {
+  if (!isMineflayerDriver()) {
+    throw new Error("command requires mineflayer backend; current backend is " + (state.driver || "none"));
+  }
   if (!state.bot || !state.connected || !state.spawned) {
-    throw new Error("bot is not connected");
+    throw new Error("mineflayer bot is not connected");
   }
   return state.bot;
 }
@@ -104,6 +1106,12 @@ function sendJson(response, statusCode, payload) {
 
 function ensureToken(request) {
   const token = request.headers["x-auth-token"];
+  if (!token || token !== config.token) {
+    throw new Error("unauthorized");
+  }
+}
+
+function ensureProvidedToken(token) {
   if (!token || token !== config.token) {
     throw new Error("unauthorized");
   }
@@ -188,7 +1196,7 @@ async function verifyMinecraftPort(host, port) {
   });
 }
 
-async function resolveConnectOptions(body) {
+async function resolveMineflayerConnectOptions(body) {
   const merged = {
     ...config.bot,
     ...(body || {})
@@ -227,14 +1235,52 @@ async function resolveConnectOptions(body) {
   return merged;
 }
 
+async function resolveRequestedDriver(body) {
+  const configuredDriver = normalizeDriverName((config.bot && config.bot.driver) || "auto");
+  const requestedDriver = normalizeDriverName(optionalStringValue(body, "driver", configuredDriver));
+  if (requestedDriver !== "auto") {
+    return requestedDriver;
+  }
+
+  try {
+    resolveModClientOptions(rootDir, config.modClient, extractModClientOverrides(body));
+    return "mod_client";
+  } catch (error) {
+    return "mineflayer";
+  }
+}
+
+function resetRuntimeConnection(closeModClientTransport) {
+  const currentModClient = state.modClient;
+  stopTelemetryLoop();
+  state.driver = "none";
+  state.bot = null;
+  state.modClient = null;
+  resetModCache();
+  state.botOptions = null;
+  state.connected = false;
+  state.connecting = false;
+  state.spawned = false;
+
+  if (closeModClientTransport && currentModClient && typeof currentModClient.close === "function") {
+    currentModClient.close();
+  }
+}
+
 function cleanupBot(bot) {
   if (state.bot !== bot) {
     return;
   }
-  state.bot = null;
-  state.connected = false;
-  state.connecting = false;
-  state.spawned = false;
+  resetRuntimeConnection(false);
+  worldMemory.setBotStatus(getStatusPayload());
+}
+
+function cleanupModClient(closeTransport) {
+  if (!state.modClient && !isModClientDriver()) {
+    return;
+  }
+  resetRuntimeConnection(closeTransport !== false);
+  worldMemory.setBotStatus(getStatusPayload());
 }
 
 function attachBotListeners(bot, options) {
@@ -244,37 +1290,73 @@ function attachBotListeners(bot, options) {
     state.connected = true;
     state.botOptions = options;
     logMessage("logged in as " + bot.username, "System");
+    updateMemorySnapshot();
   });
 
   bot.once("spawn", () => {
     state.spawned = true;
     logMessage("spawned in world", "System");
+    startTelemetryLoop();
   });
 
   bot.on("messagestr", (message) => {
     if (typeof message === "string" && message.length > 0) {
       chatHistory.add(message, "Chat");
+      worldMemory.addObservation("chat", {
+        text: message
+      });
     }
   });
 
   bot.on("whisper", (username, message) => {
     chatHistory.add("[whisper] <" + username + "> " + message, "Chat");
+    worldMemory.addObservation("whisper", {
+      username,
+      message
+    });
+  });
+
+  bot.on("playerJoined", () => {
+    worldMemory.setPlayers(getPlayersPayload());
+  });
+
+  bot.on("playerLeft", () => {
+    worldMemory.setPlayers(getPlayersPayload());
+  });
+
+  bot.on("blockUpdate", (oldBlock, newBlock) => {
+    if (newBlock) {
+      worldMemory.rememberBlock(blockPayloadFromBlock(newBlock), "block_update");
+      return;
+    }
+    if (oldBlock) {
+      worldMemory.rememberBlock(blockPayloadFromBlock(oldBlock), "block_update");
+    }
   });
 
   bot.on("error", (error) => {
     state.lastError = error && error.message ? error.message : String(error);
     logMessage(state.lastError, "Error");
+    updateMemorySnapshot();
   });
 
   bot.on("kicked", (reason) => {
     const text = typeof reason === "string" ? reason : JSON.stringify(reason);
     state.lastDisconnect = text;
     logMessage("kicked: " + text, "Error");
+    worldMemory.addObservation("disconnect", {
+      reason: text,
+      type: "kicked"
+    });
   });
 
   bot.on("end", (reason) => {
     state.lastDisconnect = reason || "connection ended";
     logMessage("disconnected: " + state.lastDisconnect, "System");
+    worldMemory.addObservation("disconnect", {
+      reason: state.lastDisconnect,
+      type: "end"
+    });
     cleanupBot(bot);
   });
 }
@@ -377,52 +1459,129 @@ async function disconnectAuxiliaryBots(bots) {
   }
 }
 
+async function connectModClient(body) {
+  const client = createModClient(rootDir, config.modClient, extractModClientOverrides(body));
+  let status;
+  try {
+    status = await client.status();
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+
+  resetRuntimeConnection(true);
+  state.driver = "mod_client";
+  state.modClient = client;
+  state.modCache.status = clone(status);
+  state.botOptions = {
+    ...client.options,
+    driver: "mod_client",
+    username: "ModClient"
+  };
+  state.connected = true;
+  state.spawned = true;
+
+  config.bot = {
+    ...config.bot,
+    driver: "mod_client"
+  };
+  config.modClient = {
+    ...config.modClient,
+    ...client.options
+  };
+  saveConfig(configPath, config);
+
+  worldMemory.addNote("mod-client connected", "system", {
+    host: client.options.host,
+    port: client.options.port,
+    configPath: client.options.configPath
+  });
+  startTelemetryLoop();
+  updateMemorySnapshot();
+  return getStatusPayload();
+}
+
 async function connectBot(body) {
   if (state.connecting) {
     throw new Error("connection already in progress");
   }
-  if (state.bot && state.connected) {
-    return getStatusPayload();
+  if ((state.bot || state.modClient) && state.connected) {
+    return isModClientDriver() ? readStatusPayload() : getStatusPayload();
   }
-
-  const options = await resolveConnectOptions(body);
-  const createOptions = buildCreateOptions(options);
 
   state.connecting = true;
   state.lastError = "";
   state.lastDisconnect = "";
 
-  const bot = mineflayer.createBot(createOptions);
-  state.bot = bot;
-  attachBotListeners(bot, options);
-
   try {
+    const driver = await resolveRequestedDriver(body);
+    if (driver === "mod_client") {
+      return await connectModClient(body);
+    }
+
+    const options = await resolveMineflayerConnectOptions(body);
+    const createOptions = buildCreateOptions(options);
+    const bot = mineflayer.createBot(createOptions);
+
+    resetRuntimeConnection(true);
+    state.driver = "mineflayer";
+    state.bot = bot;
+    attachBotListeners(bot, options);
+
     await waitForBotSpawn(bot, options.connectTimeoutMs);
+
+    config.bot = {
+      ...config.bot,
+      ...options,
+      driver: "mineflayer"
+    };
+    saveConfig(configPath, config);
+    worldMemory.addNote("bot connected", "system", {
+      host: options.host,
+      port: options.port,
+      username: options.username
+    });
+    updateMemorySnapshot();
+    return getStatusPayload();
   } catch (error) {
-    cleanupBot(bot);
+    if (isModClientDriver()) {
+      cleanupModClient(true);
+    } else if (state.bot) {
+      cleanupBot(state.bot);
+    }
     throw error;
   } finally {
     state.connecting = false;
   }
-
-  config.bot = {
-    ...config.bot,
-    ...options
-  };
-  saveConfig(configPath, config);
-  return getStatusPayload();
 }
 
 function disconnectBot() {
-  if (!state.bot) {
+  if (!state.bot && !state.modClient) {
     return {
       ok: true,
       disconnected: true
     };
   }
-  const bot = state.bot;
   actionManager.cancel();
+
+  if (isModClientDriver()) {
+    const details = modClientBotPayload(state.botOptions);
+    cleanupModClient(true);
+    worldMemory.addNote("mod-client disconnect requested", "system", {
+      host: details.host,
+      port: details.port
+    });
+    return {
+      ok: true,
+      disconnected: true
+    };
+  }
+
+  const bot = state.bot;
   bot.quit("codex disconnect");
+  worldMemory.addNote("bot disconnect requested", "system", {
+    username: bot ? bot.username : ""
+  });
   return {
     ok: true,
     disconnecting: true
@@ -450,12 +1609,17 @@ function itemPayload(item) {
 }
 
 function getInventoryPayload() {
-  if (!state.bot || !state.connected || !state.spawned) {
+  if (isModClientDriver()) {
+    return normalizeModInventoryPayload(state.modCache.inventory);
+  }
+
+  if (!isMineflayerReady()) {
     return {
       ok: true,
       connected: false,
       selectedHotbarSlot: 0,
-      items: []
+      items: [],
+      heldItem: defaultEmptyItemPayload()
     };
   }
 
@@ -475,7 +1639,11 @@ function getInventoryPayload() {
 }
 
 function getPlayersPayload() {
-  if (!state.bot || !state.connected || !state.spawned) {
+  if (isModClientDriver()) {
+    return normalizeModPlayersPayload(state.modCache.players);
+  }
+
+  if (!isMineflayerReady()) {
     return {
       ok: true,
       connected: false,
@@ -505,7 +1673,7 @@ function getPlayersPayload() {
 }
 
 function getBlockPayload(x, y, z) {
-  if (!state.bot || !state.connected || !state.spawned) {
+  if (!isMineflayerReady()) {
     return {
       ok: true,
       connected: false,
@@ -522,32 +1690,134 @@ function getBlockPayload(x, y, z) {
     };
   }
 
-  let properties = {};
-  if (typeof block.getProperties === "function") {
-    properties = block.getProperties() || {};
+  return {
+    ok: true,
+    connected: true,
+    block: blockPayloadFromBlock(block)
+  };
+}
+
+function getTargetPayload(maxDistance) {
+  if (isModClientDriver()) {
+    return normalizeModTargetPayload(state.modCache.target, maxDistance);
   }
+
+  if (!isMineflayerReady()) {
+    return {
+      ok: true,
+      connected: false,
+      target: null
+    };
+  }
+
+  const bot = state.bot;
+  const reach = Number.isFinite(maxDistance) ? maxDistance : 6;
+  const block = typeof bot.blockAtCursor === "function" ? bot.blockAtCursor(reach) : null;
+  const entity = typeof bot.entityAtCursor === "function" ? bot.entityAtCursor(reach) : null;
 
   return {
     ok: true,
     connected: true,
-    block: {
-      x,
-      y,
-      z,
-      name: block.name,
-      displayName: block.displayName || block.name,
-      stateId: block.stateId,
-      type: block.type,
-      isAir: isAir(block),
-      properties
+    target: {
+      maxDistance: reach,
+      block: block ? blockPayloadFromBlock(block) : null,
+      entity: entity ? {
+        id: entity.id,
+        name: entity.name || entity.username || entity.displayName || "",
+        type: entity.type || "",
+        kind: entity.kind || "",
+        username: entity.username || "",
+        position: entity.position ? {
+          x: Number(entity.position.x.toFixed(2)),
+          y: Number(entity.position.y.toFixed(2)),
+          z: Number(entity.position.z.toFixed(2))
+        } : null
+      } : null
+    }
+  };
+}
+
+function windowSlotPayload(window, start, end) {
+  const result = [];
+  for (let slot = start; slot < end; slot += 1) {
+    const item = window.slots[slot];
+    if (!item) {
+      continue;
+    }
+    result.push({
+      slot,
+      name: item.name,
+      count: item.count,
+      displayName: item.displayName || item.name
+    });
+  }
+  return result;
+}
+
+function containerWindowPayload(window) {
+  return {
+    title: window.title || "",
+    type: window.type || "",
+    inventoryStart: typeof window.inventoryStart === "number" ? window.inventoryStart : 0,
+    inventoryEnd: typeof window.inventoryEnd === "number" ? window.inventoryEnd : 0,
+    slots: windowSlotPayload(window, 0, typeof window.inventoryStart === "number" ? window.inventoryStart : window.slots.length)
+  };
+}
+
+function furnaceWindowPayload(furnace) {
+  return {
+    input: itemPayload(typeof furnace.inputItem === "function" ? furnace.inputItem() : null),
+    fuel: itemPayload(typeof furnace.fuelItem === "function" ? furnace.fuelItem() : null),
+    output: itemPayload(typeof furnace.outputItem === "function" ? furnace.outputItem() : null)
+  };
+}
+
+function getCapabilitiesPayload() {
+  return {
+    ok: true,
+    mode: "lan-bot",
+    driver: state.driver === "none" ? normalizeDriverName((config.bot && config.bot.driver) || "auto") : state.driver,
+    directControl: {
+      start: "node src/server.js",
+      singleCommandEndpoint: "/control/run",
+      workflowEndpoint: "/workflow/run",
+      memoryEndpoint: "/memory",
+      websocketEndpoint: "/ws?token=<token>",
+      agentEndpoints: [
+        "/agent/start",
+        "/agent/status",
+        "/agent/message",
+        "/agent/plan",
+        "/agent/run",
+        "/agent/prompt",
+        "/agent/autoplan"
+      ],
+      variableSyntax: "$last.field or $named.step.field",
+      websocketMessageTypes: [
+        "subscribe",
+        "command",
+        "workflow",
+        "agent",
+        "ping"
+      ]
+    },
+    commands: clone(DIRECT_COMMAND_SPECS),
+    agent: {
+      currentSessionId: agentRuntime.snapshot().currentSessionId || "",
+      llmConfigured: agentRuntime.llmConfigured()
     }
   };
 }
 
 function getStatusPayload() {
+  if (isModClientDriver()) {
+    return normalizeModStatusPayload(state.modCache.status);
+  }
+
   const payload = {
     ok: true,
     mode: "lan-bot",
+    driver: state.driver === "none" ? normalizeDriverName((config.bot && config.bot.driver) || "auto") : state.driver,
     connected: Boolean(state.bot && state.connected && state.spawned),
     connecting: state.connecting,
     bot: {
@@ -557,7 +1827,13 @@ function getStatusPayload() {
       auth: state.botOptions ? state.botOptions.auth : config.bot.auth,
       version: state.botOptions ? state.botOptions.version : config.bot.version
     },
-    action: actionManager.snapshot()
+    action: actionManager.snapshot(),
+    memory: worldMemory.summary(),
+    agent: {
+      currentSessionId: agentRuntime.snapshot().currentSessionId || "",
+      llmConfigured: agentRuntime.llmConfigured(),
+      sessions: agentRuntime.listSessions().slice(0, 5)
+    }
   };
 
   if (state.lastError) {
@@ -578,8 +1854,8 @@ function getStatusPayload() {
   payload.z = Number(bot.entity.position.z.toFixed(2));
   payload.yaw = Number(bot.entity.yaw.toFixed(4));
   payload.pitch = Number(bot.entity.pitch.toFixed(4));
-  payload.health = Number(bot.health.toFixed(2));
-  payload.food = bot.food;
+  payload.health = Number(Number.isFinite(bot.health) ? bot.health.toFixed(2) : "0");
+  payload.food = Number.isFinite(bot.food) ? bot.food : 0;
   payload.dimension = bot.game.dimension;
   payload.gamemode = bot.game.gameMode;
   payload.selectedHotbarSlot = typeof bot.quickBarSlot === "number" ? bot.quickBarSlot + 1 : 0;
@@ -588,9 +1864,19 @@ function getStatusPayload() {
 }
 
 async function sendChat(body) {
-  const bot = requireBot();
   const message = stringValue(body, "message");
   chatHistory.addTyped(message);
+  if (isModClientDriver()) {
+    const payload = await requireModClient().sendChat(message);
+    state.lastError = "";
+    return {
+      ok: true,
+      sent: true,
+      payload
+    };
+  }
+
+  const bot = requireBot();
   bot.chat(message);
   return {
     ok: true,
@@ -599,12 +1885,29 @@ async function sendChat(body) {
 }
 
 async function setHotbar(body) {
-  const bot = requireBot();
   const slot = numberValue(body, "slot");
   const zeroBasedSlot = Math.floor(slot) - 1;
   if (zeroBasedSlot < 0 || zeroBasedSlot > 8) {
     throw new Error("slot must be between 1 and 9");
   }
+
+  if (isModClientDriver()) {
+    const payload = await requireModClient().hotbar(zeroBasedSlot + 1);
+    if (state.modCache.status && typeof state.modCache.status === "object") {
+      state.modCache.status.selectedHotbarSlot = zeroBasedSlot + 1;
+    }
+    if (state.modCache.inventory && typeof state.modCache.inventory === "object") {
+      state.modCache.inventory.selectedHotbarSlot = zeroBasedSlot + 1;
+    }
+    state.lastError = "";
+    return {
+      ok: true,
+      slot: zeroBasedSlot + 1,
+      payload
+    };
+  }
+
+  const bot = requireBot();
   if (typeof bot.setQuickBarSlot === "function") {
     bot.setQuickBarSlot(zeroBasedSlot);
   } else {
@@ -643,15 +1946,43 @@ async function equipItem(body) {
   };
 }
 
-async function ensureNear(bot, x, y, z, range) {
+function createPathMovements(bot, options) {
+  const movements = new Movements(bot);
+  movements.allowSprinting = true;
+
+  const conservative = !options || options.conservative !== false;
+  if (conservative) {
+    movements.canDig = false;
+    movements.allow1by1towers = false;
+    movements.allowParkour = false;
+    movements.maxDropDown = 2;
+    movements.scafoldingBlocks = [];
+  }
+
+  return movements;
+}
+
+async function ensureNear(bot, x, y, z, range, options) {
   const distance = bot.entity.position.distanceTo(new Vec3(x, y, z));
   if (distance <= range) {
     return;
   }
 
-  const movements = new Movements(bot);
-  movements.allowSprinting = true;
+  const movements = createPathMovements(bot, options);
   bot.pathfinder.setMovements(movements);
+
+  if (options && options.lookAtBlock) {
+    await bot.pathfinder.goto(new goals.GoalLookAtBlock(new Vec3(x, y, z), bot.world, {
+      reach: options.reach || Math.max(4.5, range)
+    }));
+    return;
+  }
+
+  if (options && options.horizontalOnly) {
+    await bot.pathfinder.goto(new goals.GoalNearXZ(x, z, range));
+    return;
+  }
+
   await bot.pathfinder.goto(new goals.GoalNear(x, y, z, range));
 }
 
@@ -704,6 +2035,75 @@ function getItemStackSize(bot, itemName) {
   return 64;
 }
 
+function isCreativeMode(bot) {
+  return Boolean(bot && bot.game && bot.game.gameMode === "creative");
+}
+
+function buildCreativeInventorySlots() {
+  const slots = [];
+  for (let slot = 36; slot <= 44; slot += 1) {
+    slots.push(slot);
+  }
+  for (let slot = 9; slot <= 35; slot += 1) {
+    slots.push(slot);
+  }
+  return slots;
+}
+
+function createCreativeInventoryItem(bot, itemName, count) {
+  const normalized = registryItemName(itemName);
+  const registryItem = bot.registry &&
+    bot.registry.itemsByName &&
+    bot.registry.itemsByName[normalized];
+  if (!registryItem) {
+    throw new Error("unknown item: " + itemName);
+  }
+
+  const Item = prismarineItem(bot.registry);
+  const stackSize = typeof registryItem.stackSize === "number" && registryItem.stackSize > 0
+    ? registryItem.stackSize
+    : 64;
+  const itemCount = Math.max(1, Math.min(Math.floor(count || stackSize), stackSize));
+  return new Item(registryItem.id, itemCount);
+}
+
+async function setCreativeInventoryItem(bot, itemName, count, preferredSlot) {
+  if (!bot.creative || !isCreativeMode(bot)) {
+    throw new Error("creative inventory control requires creative mode");
+  }
+
+  const normalized = registryItemName(itemName);
+  const slots = buildCreativeInventorySlots();
+  let slot = Number.isFinite(preferredSlot) ? preferredSlot : null;
+  if (slot === null) {
+    slot = slots.find((entry) => {
+      const item = bot.inventory.slots[entry];
+      return item && item.name === normalized;
+    });
+  }
+  if (slot === undefined || slot === null) {
+    slot = slots.find((entry) => !bot.inventory.slots[entry]);
+  }
+  if (slot === undefined || slot === null) {
+    slot = slots[slots.length - 1];
+  }
+
+  await bot.creative.setInventorySlot(slot, createCreativeInventoryItem(bot, itemName, count));
+  return slot;
+}
+
+async function clearCreativeBuildInventory(bot) {
+  if (!bot.creative || !isCreativeMode(bot)) {
+    throw new Error("creative inventory control requires creative mode");
+  }
+
+  for (const slot of buildCreativeInventorySlots()) {
+    if (bot.inventory.slots[slot]) {
+      await bot.creative.clearSlot(slot);
+    }
+  }
+}
+
 async function dropInventoryItemCount(bot, itemName, count) {
   let remaining = Math.max(0, Math.floor(count || 0));
   while (remaining > 0) {
@@ -752,9 +2152,24 @@ async function ensureInventoryItem(bot, itemName, minimumCount, options) {
   const stackSize = getItemStackSize(bot, itemName);
   let current = countInventoryItem(bot, itemName);
   const commandBot = options && options.commandBot ? options.commandBot : bot;
+  const allowCommands = !options || options.allowCommands !== false;
+  const inventoryMode = options && options.inventoryMode ? options.inventoryMode : "";
 
   if (current >= requiredCount) {
     return current;
+  }
+
+  if (inventoryMode === "creative_manual") {
+    await setCreativeInventoryItem(bot, itemName, Math.min(requiredCount, stackSize));
+    current = countInventoryItem(bot, itemName);
+    if (current > 0) {
+      return current;
+    }
+    throw new Error("failed to obtain creative item: " + itemName);
+  }
+
+  if (!allowCommands) {
+    throw new Error("failed to obtain item without commands: " + itemName);
   }
 
   let stalledBatches = 0;
@@ -925,7 +2340,9 @@ async function moveOutOfTargetBlock(bot, x, y, z, support) {
 
   for (const offset of offsets) {
     try {
-      await ensureNear(bot, x + offset.dx, y, z + offset.dz, 1);
+      await ensureNear(bot, x + offset.dx, y, z + offset.dz, 1, {
+        horizontalOnly: true
+      });
     } catch (error) {
       continue;
     }
@@ -975,31 +2392,40 @@ async function restoreReplacedBlock(bot, itemName, position, options) {
   }
 
   const commandBot = options && options.commandBot ? options.commandBot : bot;
+  const allowCommands = !options || options.allowCommands !== false;
+  const inventoryMode = options && options.inventoryMode ? options.inventoryMode : "";
   const range = options && Number.isFinite(options.range) ? options.range : 4;
   const placeDelayMs = options && Number.isFinite(options.placeDelayMs) ? options.placeDelayMs : 100;
 
-  try {
-    await runBotCommand(
-      commandBot,
-      "/setblock " + String(position.x) + " " + String(position.y) + " " + String(position.z) + " " + itemName
-    );
-    const restoredByCommand = await waitForExpectedBlock(bot, position, itemName, 10, placeDelayMs);
-    if (restoredByCommand && restoredByCommand.name === itemName) {
-      return true;
+  if (allowCommands) {
+    try {
+      await runBotCommand(
+        commandBot,
+        "/setblock " + String(position.x) + " " + String(position.y) + " " + String(position.z) + " " + itemName
+      );
+      const restoredByCommand = await waitForExpectedBlock(bot, position, itemName, 10, placeDelayMs);
+      if (restoredByCommand && restoredByCommand.name === itemName) {
+        return true;
+      }
+    } catch (error) {
     }
-  } catch (error) {
   }
 
   try {
     await ensureInventoryItem(bot, itemName, 1, {
-      commandBot
+      commandBot,
+      allowCommands,
+      inventoryMode
     });
     const support = getPlacementSupport(bot, position.x, position.y, position.z, null);
     if (!support) {
       return false;
     }
 
-    await ensureNear(bot, position.x, position.y, position.z, range);
+    await ensureNear(bot, support.block.position.x, support.block.position.y, support.block.position.z, range, {
+      lookAtBlock: true,
+      reach: Math.max(5, range)
+    });
     await moveOutOfTargetBlock(bot, position.x, position.y, position.z, support);
     await equipItemByName(bot, itemName);
     await sendPlacePacket(bot, support, {});
@@ -1019,10 +2445,14 @@ async function placeBlockByHand(bot, placement, options) {
   const placeDelayMs = options.placeDelayMs;
   const replace = options.replace;
   const commandBot = options.commandBot || bot;
+  const allowCommands = options.allowCommands !== false;
+  const inventoryMode = options.inventoryMode || "";
   const preferredSupport = placement.preferredSupport || options.preferredSupport || null;
   const skipInventoryCheck = Boolean(options.skipInventoryCheck);
   const inventoryOptions = {
-    commandBot
+    commandBot,
+    allowCommands,
+    inventoryMode
   };
   const placeOptions = {
     ...(placement.placeOptions || {}),
@@ -1059,7 +2489,9 @@ async function placeBlockByHand(bot, placement, options) {
       if (!replace) {
         throw new Error("target occupied at " + blockKey(x, y, z) + " by " + existing.name);
       }
-      await ensureNear(bot, x, y, z, range);
+      await ensureNear(bot, x, y, z, range, {
+        horizontalOnly: true
+      });
       await bot.dig(existing, true);
       await sleep(150);
       const cleared = bot.blockAt(targetPos);
@@ -1069,11 +2501,16 @@ async function placeBlockByHand(bot, placement, options) {
       clearedOriginal = true;
     }
 
-    await ensureNear(bot, x, y, z, range);
+    await ensureNear(bot, x, y, z, range, {
+      horizontalOnly: true
+    });
 
     let lastError = null;
     for (const support of supports) {
-      await ensureNear(bot, x, y, z, range);
+      await ensureNear(bot, support.block.position.x, support.block.position.y, support.block.position.z, range, {
+        lookAtBlock: true,
+        reach: Math.max(5, range)
+      });
       await moveOutOfTargetBlock(bot, x, y, z, support);
       await equipItemByName(bot, item);
 
@@ -1107,6 +2544,8 @@ async function placeBlockByHand(bot, placement, options) {
     if (clearedOriginal && replacedBlockName) {
       const restored = await restoreReplacedBlock(bot, replacedBlockName, targetPos, {
         commandBot,
+        allowCommands,
+        inventoryMode,
         range,
         placeDelayMs
       });
@@ -1120,21 +2559,32 @@ async function placeBlockByHand(bot, placement, options) {
 
 async function clearBlockIfNeeded(bot, x, y, z, range, delayMs) {
   const position = new Vec3(x, y, z);
-  const block = bot.blockAt(position);
-  if (isAir(block)) {
+  const initialBlock = bot.blockAt(position);
+  if (isAir(initialBlock)) {
     return {
       cleared: false,
       finalBlock: "air"
     };
   }
 
-  await ensureNear(bot, x, y, z, range);
-  await bot.dig(block, true);
-  await sleep(delayMs);
-  return {
-    cleared: true,
-    finalBlock: "air"
-  };
+  await ensureNear(bot, x, y, z, range, {
+    horizontalOnly: true
+  });
+  await bot.dig(initialBlock, true);
+
+  let finalBlock = bot.blockAt(position);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await sleep(delayMs);
+    finalBlock = bot.blockAt(position);
+    if (isAir(finalBlock)) {
+      return {
+        cleared: true,
+        finalBlock: "air"
+      };
+    }
+  }
+
+  throw new Error("failed to clear block at " + blockKey(x, y, z) + ", got " + (finalBlock ? finalBlock.name : "unknown"));
 }
 
 function parseBlockPlacements(body) {
@@ -1263,6 +2713,17 @@ async function ensurePlacementInventory(bot, placements, extraRequirements, opti
   }
 
   const entries = Array.from(requiredCounts.entries()).sort((left, right) => right[1] - left[1]);
+  const inventoryMode = options && options.inventoryMode ? options.inventoryMode : "";
+  if (inventoryMode === "creative_manual") {
+    await clearCreativeBuildInventory(bot);
+    const slots = buildCreativeInventorySlots();
+    for (let index = 0; index < entries.length; index += 1) {
+      const [itemName] = entries[index];
+      await setCreativeInventoryItem(bot, itemName, getItemStackSize(bot, itemName), slots[index]);
+    }
+    return;
+  }
+
   for (const [itemName, count] of entries) {
     await ensureInventoryItem(bot, itemName, count, options);
   }
@@ -2499,7 +3960,7 @@ function buildReferencePathChainPlacements(originX, originY, originZ, palette) {
   const centerZ = originZ + 4 + halfWidth;
 
   function setPlacement(x, y, z, item, stage, extra) {
-    placements.set(blockKey(x, y, z), {
+    placements.set(stage + "|" + blockKey(x, y, z), {
       x,
       y,
       z,
@@ -2509,23 +3970,40 @@ function buildReferencePathChainPlacements(originX, originY, originZ, palette) {
     });
   }
 
-  function fillLeafCross(baseX, baseY, baseZ) {
-    const offsets = [
-      [0, 0, 0],
-      [1, 0, 0],
-      [-1, 0, 0],
-      [0, 0, 1],
-      [0, 0, -1],
-      [0, 1, 0],
-      [1, 1, 0],
-      [-1, 1, 0],
-      [0, 1, 1],
-      [0, 1, -1]
-    ];
+  function makePreferredSupport(supportX, supportY, supportZ, faceX, faceY, faceZ) {
+    return {
+      position: new Vec3(supportX, supportY, supportZ),
+      face: new Vec3(faceX, faceY, faceZ)
+    };
+  }
 
-    for (const [dx, dy, dz] of offsets) {
-      setPlacement(baseX + dx, baseY + dy, baseZ + dz, leafItem, "decor");
+  function addTreeCanopy(treeX, treeZ) {
+    const trunkTopY = originY + 4;
+    const centerLeafY = originY + 5;
+    const upperLeafY = originY + 6;
+
+    setPlacement(treeX, centerLeafY, treeZ, leafItem, "decor_base", {
+      preferredSupport: makePreferredSupport(treeX, trunkTopY, treeZ, 0, 1, 0)
+    });
+
+    const sideOffsets = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1]
+    ];
+    for (const [dx, dz] of sideOffsets) {
+      setPlacement(treeX + dx, centerLeafY, treeZ + dz, leafItem, "decor_leaf", {
+        preferredSupport: makePreferredSupport(treeX, centerLeafY, treeZ, dx, 0, dz)
+      });
+      setPlacement(treeX + dx, upperLeafY, treeZ + dz, leafItem, "decor_top", {
+        preferredSupport: makePreferredSupport(treeX + dx, centerLeafY, treeZ + dz, 0, 1, 0)
+      });
     }
+
+    setPlacement(treeX, centerLeafY, treeZ, lanternItem, "decor_finish", {
+      preferredSupport: makePreferredSupport(treeX, trunkTopY, treeZ, 0, 1, 0)
+    });
   }
 
   function addTreePair(stepIndex) {
@@ -2541,10 +4019,8 @@ function buildReferencePathChainPlacements(originX, originY, originZ, palette) {
       setPlacement(rightX, y, rightZ, postItem, "posts");
     }
 
-    setPlacement(leftX, originY + 5, leftZ, lanternItem, "decor");
-    setPlacement(rightX, originY + 5, rightZ, lanternItem, "decor");
-    fillLeafCross(leftX, originY + 5, leftZ);
-    fillLeafCross(rightX, originY + 5, rightZ);
+    addTreeCanopy(leftX, leftZ);
+    addTreeCanopy(rightX, rightZ);
   }
 
   function addShrubPair(stepIndex) {
@@ -2555,8 +4031,8 @@ function buildReferencePathChainPlacements(originX, originY, originZ, palette) {
     const rightX = anchorX - perpX * (halfWidth + 2);
     const rightZ = anchorZ - perpZ * (halfWidth + 2);
 
-    setPlacement(leftX, originY + 1, leftZ, shrubItem, "decor");
-    setPlacement(rightX, originY + 1, rightZ, shrubItem, "decor");
+    setPlacement(leftX, originY + 1, leftZ, shrubItem, "decor_base");
+    setPlacement(rightX, originY + 1, rightZ, shrubItem, "decor_base");
   }
 
   function groundItemFor(style, lateral, stepIndex) {
@@ -2686,6 +4162,92 @@ async function rightClickBlockWithItem(bot, itemName, x, y, z, range, delayMs, o
   return block;
 }
 
+function directionVectorToNumber(direction) {
+  if (direction.y < 0) {
+    return 0;
+  }
+  if (direction.y > 0) {
+    return 1;
+  }
+  if (direction.z < 0) {
+    return 2;
+  }
+  if (direction.z > 0) {
+    return 3;
+  }
+  if (direction.x < 0) {
+    return 4;
+  }
+  return 5;
+}
+
+function nextUseSequence(bot) {
+  const current = Number.isFinite(bot.__codexUseSequence) ? bot.__codexUseSequence : 0;
+  const next = current + 1;
+  bot.__codexUseSequence = next;
+  return next;
+}
+
+async function useHeldItemOnBlockFace(bot, block, direction, cursorPos, forceLook) {
+  if (!block) {
+    throw new Error("target block not found");
+  }
+  if (!bot.heldItem) {
+    throw new Error("must be holding an item");
+  }
+
+  const face = direction || new Vec3(0, 1, 0);
+  const cursor = cursorPos || new Vec3(0.5, 0.5, 0.5);
+  if (forceLook !== false) {
+    await bot.lookAt(block.position.offset(cursor.x, cursor.y, cursor.z), true);
+  }
+
+  if (bot.supportFeature("blockPlaceHasHeldItem")) {
+    bot._client.write("block_place", {
+      location: block.position,
+      direction: directionVectorToNumber(face),
+      heldItem: prismarineItem(bot.registry).toNotch(bot.heldItem),
+      cursorX: Math.floor(cursor.x * 16),
+      cursorY: Math.floor(cursor.y * 16),
+      cursorZ: Math.floor(cursor.z * 16)
+    });
+  } else if (bot.supportFeature("blockPlaceHasHandAndIntCursor")) {
+    bot._client.write("block_place", {
+      location: block.position,
+      direction: directionVectorToNumber(face),
+      hand: 0,
+      cursorX: Math.floor(cursor.x * 16),
+      cursorY: Math.floor(cursor.y * 16),
+      cursorZ: Math.floor(cursor.z * 16)
+    });
+  } else if (bot.supportFeature("blockPlaceHasHandAndFloatCursor")) {
+    bot._client.write("block_place", {
+      location: block.position,
+      direction: directionVectorToNumber(face),
+      hand: 0,
+      cursorX: cursor.x,
+      cursorY: cursor.y,
+      cursorZ: cursor.z
+    });
+  } else if (bot.supportFeature("blockPlaceHasInsideBlock")) {
+    bot._client.write("block_place", {
+      location: block.position,
+      direction: directionVectorToNumber(face),
+      hand: 0,
+      cursorX: cursor.x,
+      cursorY: cursor.y,
+      cursorZ: cursor.z,
+      insideBlock: false,
+      worldBorderHit: false,
+      sequence: nextUseSequence(bot)
+    });
+  } else {
+    throw new Error("block interaction packet not supported");
+  }
+
+  bot.swingArm("right");
+}
+
 async function ensureSupportBlockByHand(bot, x, y, z, itemName, range, delayMs) {
   const supportBlock = bot.blockAt(new Vec3(x, y, z));
   if (!isAir(supportBlock)) {
@@ -2707,7 +4269,7 @@ async function ensureSupportBlockByHand(bot, x, y, z, itemName, range, delayMs) 
   });
 }
 
-async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
+async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs, options) {
   const targetPos = new Vec3(x, y, z);
   const existing = bot.blockAt(targetPos);
   if (existing && existing.name === "water") {
@@ -2731,28 +4293,26 @@ async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
     throw new Error("water support missing at " + blockKey(x, y - 1, z));
   }
 
-  try {
-    await ensureInventoryItem(bot, itemName, 1);
-    await ensureNear(bot, x, y, z, range);
-    await equipItemByName(bot, itemName);
-    try {
-      if (typeof bot._placeBlockWithOptions === "function") {
-        await bot._placeBlockWithOptions(supportBlock, new Vec3(0, 1, 0), {
-          delta: new Vec3(0.5, 1, 0.5),
-          forceLook: true,
-          swingArm: "right"
-        });
-      } else {
-        await bot.activateBlock(supportBlock, new Vec3(0, 1, 0), new Vec3(0.5, 1, 0.5));
-      }
-    } catch (error) {
-      const placedAfterError = bot.blockAt(targetPos);
-      if (!placedAfterError || placedAfterError.name !== "water") {
-        throw error;
-      }
-    }
+  const inventoryOptions = {
+    ...(options || {})
+  };
+  await ensureInventoryItem(bot, itemName, 1, inventoryOptions);
+  await ensureNear(bot, x, y - 1, z, range, {
+    lookAtBlock: true,
+    reach: Math.max(4.5, range)
+  });
+  await equipItemByName(bot, itemName);
+  const face = new Vec3(0, 1, 0);
+  const cursors = [
+    new Vec3(0.5, 0.999, 0.5),
+    new Vec3(0.5, 0.875, 0.5),
+    new Vec3(0.5, 0.75, 0.5),
+    new Vec3(0.55, 0.99, 0.55),
+    new Vec3(0.45, 0.99, 0.45)
+  ];
 
-    for (let attempt = 0; attempt < 12; attempt += 1) {
+  async function waitForWater(method, cursor) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
       await sleep(delayMs);
       const placed = bot.blockAt(targetPos);
       if (placed && placed.name === "water") {
@@ -2763,46 +4323,69 @@ async function placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs) {
           placed: true,
           skipped: false,
           finalBlock: placed.name,
-          method: "bucket"
+          method,
+          cursor: cursor ? { x: cursor.x, y: cursor.y, z: cursor.z } : null
         };
       }
     }
-  } catch (error) {
-    // fall through to ice fallback
+    return null;
   }
 
-  const iceItem = "ice";
-  await ensureInventoryItem(bot, iceItem, 1);
-  await placeBlockByHand(bot, { x, y, z, item: iceItem }, {
-    range,
-    placeDelayMs: delayMs,
-    replace: false
-  });
+  const errors = [];
+  for (const cursor of cursors) {
+    const bucketAttempts = [
+      {
+        method: "use_on_packet",
+        run: async () => {
+          await useHeldItemOnBlockFace(bot, supportBlock, face, cursor, true);
+        }
+      },
+      {
+        method: "activate_block",
+        run: async () => {
+          await bot.lookAt(supportBlock.position.offset(cursor.x, cursor.y, cursor.z), true);
+          await bot.activateBlock(supportBlock, face, cursor);
+        }
+      },
+      {
+        method: "activate_item",
+        run: async () => {
+          await bot.lookAt(supportBlock.position.offset(cursor.x, cursor.y, cursor.z), true);
+          await bot.activateItem(false);
+        }
+      }
+    ];
 
-  const iceBlock = bot.blockAt(targetPos);
-  if (!iceBlock || iceBlock.name !== iceItem) {
-    throw new Error("failed to place ice at " + blockKey(x, y, z));
-  }
+    if (typeof bot._placeBlockWithOptions === "function") {
+      bucketAttempts.splice(1, 0, {
+        method: "place_with_options",
+        run: async () => {
+          await bot._placeBlockWithOptions(supportBlock, face, {
+            delta: cursor,
+            forceLook: true,
+            swingArm: "right"
+          });
+        }
+      });
+    }
 
-  await ensureNear(bot, x, y, z, range);
-  await bot.dig(iceBlock, true);
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    await sleep(delayMs);
-    const placed = bot.blockAt(targetPos);
-    if (placed && placed.name === "water") {
-      return {
-        x,
-        y,
-        z,
-        placed: true,
-        skipped: false,
-        finalBlock: placed.name,
-        method: "ice"
-      };
+    for (const attempt of bucketAttempts) {
+      try {
+        await attempt.run();
+      } catch (error) {
+        errors.push(attempt.method + "@" + cursor.x.toFixed(3) + "," + cursor.y.toFixed(3) + "," + cursor.z.toFixed(3) + ": " + error.message);
+      }
+      const waterResult = await waitForWater(attempt.method, cursor);
+      if (waterResult) {
+        return waterResult;
+      }
     }
   }
 
-  throw new Error("failed to place water at " + blockKey(x, y, z));
+  const finalBlock = bot.blockAt(targetPos);
+  const finalName = finalBlock ? finalBlock.name : "air";
+  const details = errors.length > 0 ? " attempts=" + errors.join(" | ") : "";
+  throw new Error("failed to place water at " + blockKey(x, y, z) + ", got " + finalName + details);
 }
 
 async function isDoubleChestContainer(bot, x, y, z, range) {
@@ -2912,30 +4495,1387 @@ async function arrangeItemsInChest(window, bot, itemName, patternSlots, remainde
   }
 }
 
-async function moveTo(body) {
-  return actionManager.run("move_to", async () => {
-    const bot = requireBot();
-    const x = numberValue(body, "x");
-    const y = numberValue(body, "y");
-    const z = numberValue(body, "z");
-    const range = numberValue(body, "range", 1);
-
-    await ensureNear(bot, x, y, z, range);
-    return {
-      ok: true,
-      x,
-      y,
-      z,
-      range
-    };
-  });
+async function depositContainerItem(window, bot, itemName, count) {
+  const normalized = registryItemName(itemName);
+  const registryItem = bot.registry.itemsByName[normalized];
+  if (!registryItem) {
+    throw new Error("unknown item: " + itemName);
+  }
+  await window.deposit(registryItem.id, null, count);
 }
 
-async function lookAt(body) {
+async function withdrawContainerItem(window, bot, itemName, count) {
+  const normalized = registryItemName(itemName);
+  const registryItem = bot.registry.itemsByName[normalized];
+  if (!registryItem) {
+    throw new Error("unknown item: " + itemName);
+  }
+  await window.withdraw(registryItem.id, null, count);
+}
+
+async function waitForInventoryItemCount(bot, itemName, minimumCount, timeoutMs) {
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    if (countInventoryItem(bot, itemName) >= minimumCount) {
+      return true;
+    }
+    await sleep(200);
+  }
+  return countInventoryItem(bot, itemName) >= minimumCount;
+}
+
+async function waitForFurnaceOutput(furnace, itemName, timeoutMs) {
+  const startedAt = Date.now();
+  while ((Date.now() - startedAt) < timeoutMs) {
+    const output = furnace.outputItem();
+    if (output && output.name === itemName && output.count > 0) {
+      return output;
+    }
+    await sleep(250);
+  }
+  return furnace.outputItem();
+}
+
+async function fishUntilCookable(bot, options) {
+  const fishingSpot = options.fishingSpot;
+  const maxAttempts = Math.max(1, Math.floor(options.maxAttempts || 8));
+  const castTimeoutMs = Math.max(3000, Math.floor(options.castTimeoutMs || 30000));
+  const rawFishNames = options.rawFishNames || ["cod", "salmon"];
+  const previousCounts = {};
+  for (const itemName of rawFishNames) {
+    previousCounts[itemName] = countInventoryItem(bot, itemName);
+  }
+
+  await ensureInventoryItem(bot, options.rodItem || "fishing_rod", 1, {
+    allowCommands: options.allowCommands,
+    inventoryMode: options.inventoryMode
+  });
+  await equipItemByName(bot, options.rodItem || "fishing_rod");
+  await ensureNear(bot, fishingSpot.x, fishingSpot.y, fishingSpot.z, 1, {
+    horizontalOnly: true
+  });
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await bot.lookAt(new Vec3(fishingSpot.lookX, fishingSpot.lookY, fishingSpot.lookZ), true);
+    try {
+      await Promise.race([
+        bot.fish(),
+        sleep(castTimeoutMs).then(() => {
+          try {
+            bot.activateItem();
+          } catch (error) {
+          }
+          throw new Error("fishing cast timeout");
+        })
+      ]);
+    } catch (error) {
+      await sleep(500);
+      continue;
+    }
+    await sleep(1500);
+
+    for (const itemName of rawFishNames) {
+      const current = countInventoryItem(bot, itemName);
+      if (current > previousCounts[itemName]) {
+        return {
+          caughtItem: itemName,
+          count: current - previousCounts[itemName],
+          totals: Object.fromEntries(rawFishNames.map((name) => [name, countInventoryItem(bot, name)])),
+          attempts: attempt + 1
+        };
+      }
+    }
+  }
+
+  return {
+    caughtItem: "",
+    count: 0,
+    totals: Object.fromEntries(rawFishNames.map((name) => [name, countInventoryItem(bot, name)])),
+    attempts: maxAttempts
+  };
+}
+
+function normalizeCommandName(command) {
+  return String(command || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\/\s-]+/g, "_");
+}
+
+function extractCommandArgs(body) {
+  if (body && body.args && typeof body.args === "object" && !Array.isArray(body.args)) {
+    return body.args;
+  }
+
+  const args = {
+    ...(body || {})
+  };
+  delete args.args;
+  delete args.command;
+  delete args.op;
+  delete args.action;
+  delete args.label;
+  delete args.steps;
+  delete args.continueOnError;
+  delete args.remember;
+  delete args.saveAs;
+  return args;
+}
+
+function resolvePathValue(source, rawPath) {
+  const pathText = String(rawPath || "").replace(/\[(\d+)\]/g, ".$1");
+  const segments = pathText.split(".").filter(Boolean);
+  let current = source;
+
+  for (const segment of segments) {
+    if (current === null || typeof current === "undefined") {
+      return undefined;
+    }
+    current = current[segment];
+  }
+
+  return current;
+}
+
+function resolveWorkflowValue(value, scope) {
+  if (typeof value === "string" && value.startsWith("$")) {
+    return resolvePathValue(scope, value.slice(1));
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => resolveWorkflowValue(entry, scope));
+  }
+
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const [key, entry] of Object.entries(value)) {
+      result[key] = resolveWorkflowValue(entry, scope);
+    }
+    return result;
+  }
+
+  return value;
+}
+
+function buildWorkflowScope(label) {
+  return {
+    label,
+    named: {},
+    last: null,
+    results: [],
+    memory: worldMemory.snapshot().memory,
+    status: getStatusPayload()
+  };
+}
+
+function getInventoryOptions(body) {
+  return {
+    allowCommands: !body || body.allowCommands !== false,
+    inventoryMode: body && typeof body.inventoryMode === "string" ? body.inventoryMode : ""
+  };
+}
+
+function cookedVariantForRaw(itemName) {
+  const normalized = registryItemName(itemName);
+  if (normalized === "cod") {
+    return "cooked_cod";
+  }
+  if (normalized === "salmon") {
+    return "cooked_salmon";
+  }
+  return "";
+}
+
+async function moveToDirect(body) {
   const bot = requireBot();
   const x = numberValue(body, "x");
   const y = numberValue(body, "y");
   const z = numberValue(body, "z");
+  const range = numberValue(body, "range", 1);
+
+  await ensureNear(bot, x, y, z, range);
+  updateMemorySnapshot();
+  return {
+    ok: true,
+    x,
+    y,
+    z,
+    range
+  };
+}
+
+async function waitCommand(body) {
+  const milliseconds = "milliseconds" in body
+    ? numberValue(body, "milliseconds", 0)
+    : ("ms" in body ? numberValue(body, "ms", 0) : Math.floor(numberValue(body, "seconds", 0) * 1000));
+  const waitedMs = Math.max(0, Math.floor(milliseconds));
+  await sleep(waitedMs);
+  return {
+    ok: true,
+    waitedMs
+  };
+}
+
+async function digBlock(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const delayMs = numberValue(body, "delayMs", 150);
+  const block = bot.blockAt(new Vec3(x, y, z));
+
+  if (!block || isAir(block)) {
+    return {
+      ok: true,
+      dug: false,
+      skipped: true,
+      block: getBlockPayload(x, y, z).block
+    };
+  }
+
+  await ensureNear(bot, x, y, z, range, {
+    horizontalOnly: true
+  });
+  await bot.dig(block, true);
+  await sleep(delayMs);
+  const payload = getBlockPayload(x, y, z);
+  worldMemory.rememberBlock(payload.block, "dig");
+  return {
+    ok: true,
+    dug: true,
+    block: payload.block
+  };
+}
+
+async function clearBlockCommand(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const delayMs = numberValue(body, "delayMs", 150);
+  const result = await clearBlockIfNeeded(bot, x, y, z, range, delayMs);
+  const payload = getBlockPayload(x, y, z);
+  worldMemory.rememberBlock(payload.block, "clear_block");
+  return {
+    ok: true,
+    ...result,
+    block: payload.block
+  };
+}
+
+async function placeWaterCommand(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const delayMs = numberValue(body, "delayMs", 200);
+  const itemName = optionalStringValue(body, "item", "water_bucket");
+  const result = await placeWaterSourceByHand(bot, itemName, x, y, z, range, delayMs, getInventoryOptions(body));
+  const payload = getBlockPayload(x, y, z);
+  worldMemory.rememberBlock(payload.block, "place_water");
+  return {
+    ok: true,
+    ...result,
+    block: payload.block
+  };
+}
+
+async function openContainerAt(bot, x, y, z, range) {
+  await ensureNear(bot, x, y, z, range, {
+    lookAtBlock: true,
+    reach: Math.max(4.5, range)
+  });
+  const block = bot.blockAt(new Vec3(x, y, z));
+  if (!block) {
+    throw new Error("container block not found at " + blockKey(x, y, z));
+  }
+  const window = await bot.openContainer(block);
+  return {
+    block,
+    window
+  };
+}
+
+async function readContainer(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const { block, window } = await openContainerAt(bot, x, y, z, range);
+  try {
+    const container = containerWindowPayload(window);
+    worldMemory.rememberContainer({
+      x,
+      y,
+      z,
+      name: block.name,
+      title: container.title,
+      slots: container.slots,
+      source: "read_container"
+    });
+    return {
+      ok: true,
+      block: blockPayloadFromBlock(block),
+      container
+    };
+  } finally {
+    window.close();
+    await sleep(120);
+  }
+}
+
+async function containerDeposit(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const itemName = stringValue(body, "item");
+  const count = Math.max(1, Math.floor(numberValue(body, "count", 1)));
+  const { block, window } = await openContainerAt(bot, x, y, z, range);
+  try {
+    await depositContainerItem(window, bot, itemName, count);
+    const container = containerWindowPayload(window);
+    worldMemory.rememberContainer({
+      x,
+      y,
+      z,
+      name: block.name,
+      title: container.title,
+      slots: container.slots,
+      source: "container_deposit"
+    });
+    return {
+      ok: true,
+      item: itemName,
+      count,
+      block: blockPayloadFromBlock(block),
+      container
+    };
+  } finally {
+    window.close();
+    await sleep(120);
+  }
+}
+
+async function containerWithdraw(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const itemName = stringValue(body, "item");
+  const count = Math.max(1, Math.floor(numberValue(body, "count", 1)));
+  const { block, window } = await openContainerAt(bot, x, y, z, range);
+  try {
+    await withdrawContainerItem(window, bot, itemName, count);
+    const container = containerWindowPayload(window);
+    worldMemory.rememberContainer({
+      x,
+      y,
+      z,
+      name: block.name,
+      title: container.title,
+      slots: container.slots,
+      source: "container_withdraw"
+    });
+    return {
+      ok: true,
+      item: itemName,
+      count,
+      block: blockPayloadFromBlock(block),
+      container
+    };
+  } finally {
+    window.close();
+    await sleep(120);
+  }
+}
+
+async function openFurnaceAt(bot, x, y, z, range) {
+  await ensureNear(bot, x, y, z, range, {
+    lookAtBlock: true,
+    reach: Math.max(4.5, range)
+  });
+  const block = bot.blockAt(new Vec3(x, y, z));
+  if (!block) {
+    throw new Error("furnace block not found at " + blockKey(x, y, z));
+  }
+  const furnace = await bot.openFurnace(block);
+  return {
+    block,
+    furnace
+  };
+}
+
+async function readFurnace(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const { block, furnace } = await openFurnaceAt(bot, x, y, z, range);
+  try {
+    const furnaceState = furnaceWindowPayload(furnace);
+    worldMemory.rememberFurnace({
+      x,
+      y,
+      z,
+      name: block.name,
+      ...furnaceState,
+      source: "read_furnace"
+    });
+    return {
+      ok: true,
+      block: blockPayloadFromBlock(block),
+      furnace: furnaceState
+    };
+  } finally {
+    furnace.close();
+    await sleep(120);
+  }
+}
+
+async function smeltItem(body) {
+  const bot = requireBot();
+  const x = Math.floor(numberValue(body, "x"));
+  const y = Math.floor(numberValue(body, "y"));
+  const z = Math.floor(numberValue(body, "z"));
+  const range = numberValue(body, "range", 4);
+  const inputItem = stringValue(body, "inputItem");
+  const inputCount = Math.max(1, Math.floor(numberValue(body, "inputCount", 1)));
+  const fuelItem = optionalStringValue(body, "fuelItem", "coal");
+  const fuelCount = Math.max(1, Math.floor(numberValue(body, "fuelCount", 1)));
+  const timeoutMs = Math.max(1000, Math.floor(numberValue(body, "timeoutMs", 45000)));
+  const outputItem = optionalStringValue(body, "outputItem", cookedVariantForRaw(inputItem));
+  const inventoryOptions = getInventoryOptions(body);
+
+  if (!outputItem) {
+    throw new Error("outputItem is required for smelt_item when it cannot be inferred");
+  }
+
+  await ensureInventoryItem(bot, inputItem, inputCount, inventoryOptions);
+  await ensureInventoryItem(bot, fuelItem, fuelCount, inventoryOptions);
+
+  const { block, furnace } = await openFurnaceAt(bot, x, y, z, range);
+  try {
+    const inputRegistry = bot.registry.itemsByName[registryItemName(inputItem)];
+    const fuelRegistry = bot.registry.itemsByName[registryItemName(fuelItem)];
+    if (!inputRegistry || !fuelRegistry) {
+      throw new Error("unknown furnace item");
+    }
+
+    await furnace.putInput(inputRegistry.id, null, inputCount);
+    await furnace.putFuel(fuelRegistry.id, null, fuelCount);
+    const output = await waitForFurnaceOutput(furnace, outputItem, timeoutMs);
+    if (!output || output.name !== outputItem) {
+      throw new Error("furnace did not produce " + outputItem);
+    }
+    const taken = await furnace.takeOutput();
+    const furnaceState = furnaceWindowPayload(furnace);
+    worldMemory.rememberFurnace({
+      x,
+      y,
+      z,
+      name: block.name,
+      ...furnaceState,
+      source: "smelt_item"
+    });
+    return {
+      ok: true,
+      block: blockPayloadFromBlock(block),
+      taken: itemPayload(taken),
+      furnace: furnaceState
+    };
+  } finally {
+    furnace.close();
+    await sleep(120);
+  }
+}
+
+async function consumeItem(body) {
+  const bot = requireBot();
+  const itemName = optionalStringValue(body, "item", "");
+  const inventoryOptions = getInventoryOptions(body);
+  if (itemName) {
+    await ensureInventoryItem(bot, itemName, 1, inventoryOptions);
+    await equipItemByName(bot, itemName);
+  }
+  await bot.consume();
+  updateMemorySnapshot();
+  return {
+    ok: true,
+    item: itemName || (bot.heldItem ? bot.heldItem.name : "")
+  };
+}
+
+async function fishUntilCommand(body) {
+  const bot = requireBot();
+  const x = "x" in body ? numberValue(body, "x") : bot.entity.position.x;
+  const y = "y" in body ? numberValue(body, "y") : bot.entity.position.y;
+  const z = "z" in body ? numberValue(body, "z") : bot.entity.position.z;
+  const rawFishNames = Array.isArray(body.rawFishNames) && body.rawFishNames.length > 0
+    ? body.rawFishNames.map((entry) => registryItemName(entry))
+    : ["cod", "salmon"];
+  const fishingSpot = {
+    x,
+    y,
+    z,
+    lookX: "lookX" in body ? numberValue(body, "lookX") : x,
+    lookY: "lookY" in body ? numberValue(body, "lookY") : y,
+    lookZ: "lookZ" in body ? numberValue(body, "lookZ") : z
+  };
+  const result = await fishUntilCookable(bot, {
+    fishingSpot,
+    maxAttempts: Math.max(1, Math.floor(numberValue(body, "fishAttempts", 8))),
+    castTimeoutMs: Math.max(3000, Math.floor(numberValue(body, "timeoutMs", 30000))),
+    rawFishNames,
+    rodItem: optionalStringValue(body, "rodItem", "fishing_rod"),
+    allowCommands: body.allowCommands !== false,
+    inventoryMode: typeof body.inventoryMode === "string" ? body.inventoryMode : ""
+  });
+  worldMemory.addObservation("fish_until", result);
+  return {
+    ok: true,
+    fishingSpot,
+    ...result
+  };
+}
+
+async function executeDirectCommand(command, rawArgs, context) {
+  const normalized = normalizeCommandName(command);
+  const args = resolveWorkflowValue(rawArgs || {}, context && context.scope ? context.scope : {});
+
+  switch (normalized) {
+    case "status":
+    case "read_status":
+      if (!isModClientDriver()) {
+        updateMemorySnapshot();
+      }
+      return readStatusPayload();
+    case "full_state":
+    case "read_full_state":
+      if (!isModClientDriver()) {
+        updateMemorySnapshot();
+      }
+      return readFullStatePayload();
+    case "inventory":
+    case "read_inventory":
+      return readInventoryPayload();
+    case "players":
+    case "read_players":
+      {
+        const payload = await readPlayersPayload();
+        worldMemory.setPlayers(payload);
+        return payload;
+      }
+    case "block":
+    case "read_block": {
+      const payload = await readBlockPayload(
+        Math.floor(numberValue(args, "x")),
+        Math.floor(numberValue(args, "y")),
+        Math.floor(numberValue(args, "z"))
+      );
+      worldMemory.rememberBlock(payload.block, "read_block");
+      return payload;
+    }
+    case "target":
+    case "read_target": {
+      const payload = await readTargetPayload(numberValue(args, "maxDistance", 6));
+      worldMemory.addObservation("target", payload.target);
+      return payload;
+    }
+    case "screen":
+    case "read_screen":
+      return readScreenCommand(args);
+    case "memory":
+    case "read_memory":
+      return worldMemory.snapshot();
+    case "chat":
+      return sendChat(args);
+    case "hotbar":
+      return setHotbar(args);
+    case "equip":
+      return equipItem(args);
+    case "move_to":
+      return moveToDirect(args);
+    case "look_at": {
+      const result = await lookAt(args);
+      worldMemory.addObservation("look_at", result.lookedAt);
+      return result;
+    }
+    case "use_item":
+      return useItem(args);
+    case "interact_block":
+      return interactBlockCommand(args);
+    case "set_input":
+      return setInputCommand(args);
+    case "tap_key":
+      return tapKeyCommand(args);
+    case "release_all":
+      return releaseAllCommand(args);
+    case "gui_click":
+      return guiClickCommand(args);
+    case "gui_release":
+      return guiReleaseCommand(args);
+    case "gui_scroll":
+      return guiScrollCommand(args);
+    case "gui_key":
+      return guiKeyCommand(args);
+    case "gui_type":
+      return guiTypeCommand(args);
+    case "gui_click_widget":
+      return guiClickWidgetCommand(args);
+    case "gui_close":
+      return guiCloseCommand(args);
+    case "screenshot":
+      return screenshotCommand(args);
+    case "debug_fake_player":
+    case "debug_fake_player_list":
+      return debugFakePlayerListCommand(args);
+    case "debug_fake_player_spawn":
+      return debugFakePlayerSpawnCommand(args);
+    case "debug_fake_player_move":
+      return debugFakePlayerMoveCommand(args);
+    case "debug_fake_player_remove":
+      return debugFakePlayerRemoveCommand(args);
+    case "place": {
+      const result = await placeItem(args);
+      if ("x" in args && "y" in args && "z" in args) {
+        const payload = getBlockPayload(Math.floor(Number(args.x)), Math.floor(Number(args.y)), Math.floor(Number(args.z)));
+        worldMemory.rememberBlock(payload.block, "place");
+      }
+      return result;
+    }
+    case "place_water":
+      return placeWaterCommand(args);
+    case "dig":
+      return digBlock(args);
+    case "clear_block":
+      return clearBlockCommand(args);
+    case "read_container":
+      return readContainerCommand(args);
+    case "container_deposit":
+      return containerDeposit(args);
+    case "container_withdraw":
+      return containerWithdraw(args);
+    case "read_furnace":
+      return readFurnace(args);
+    case "smelt_item":
+      return smeltItem(args);
+    case "consume":
+      return consumeItem(args);
+    case "fish_until":
+      return fishUntilCommand(args);
+    case "wait":
+      return waitCommand(args);
+    case "memory_note": {
+      const note = worldMemory.addNote(stringValue(args, "text"), optionalStringValue(args, "tag", "note"), args.extra);
+      return {
+        ok: true,
+        note
+      };
+    }
+    case "memory_waypoint": {
+      const name = stringValue(args, "name");
+      const waypoint = worldMemory.setWaypoint(name, {
+        position: {
+          x: numberValue(args, "x"),
+          y: numberValue(args, "y"),
+          z: numberValue(args, "z")
+        },
+        note: optionalStringValue(args, "note", ""),
+        dimension: optionalStringValue(args, "dimension", "")
+      });
+      return {
+        ok: true,
+        waypoint
+      };
+    }
+    case "memory_context": {
+      let patch = {};
+      if (args.patch && typeof args.patch === "object" && !Array.isArray(args.patch)) {
+        patch = args.patch;
+      } else if ("key" in args) {
+        patch[stringValue(args, "key")] = args.value;
+      } else {
+        patch = extractCommandArgs(args);
+      }
+      return {
+        ok: true,
+        context: worldMemory.updateContext(patch)
+      };
+    }
+    default:
+      throw new Error("unsupported direct command: " + normalized);
+  }
+}
+
+async function runDirectControl(body) {
+  const rawCommand = body && (body.command || body.op || body.action);
+  if (typeof rawCommand !== "string" || rawCommand.length === 0) {
+    throw new Error("command is required");
+  }
+
+  const scope = buildWorkflowScope("direct_control");
+  const result = await executeDirectCommand(rawCommand, extractCommandArgs(body), {
+    scope
+  });
+  return {
+    ok: true,
+    command: normalizeCommandName(rawCommand),
+    result
+  };
+}
+
+async function runWorkflow(body) {
+  const steps = Array.isArray(body.steps) ? body.steps : [];
+  if (steps.length === 0) {
+    throw new Error("steps must be a non-empty array");
+  }
+
+  const label = optionalStringValue(body, "label", "workflow");
+  const continueOnError = boolValue(body, "continueOnError", false);
+
+  return actionManager.run(label, async (manager) => {
+    const scope = buildWorkflowScope(label);
+    const results = [];
+    worldMemory.addNote("workflow started", "workflow", {
+      label,
+      stepCount: steps.length
+    });
+
+    for (let index = 0; index < steps.length; index += 1) {
+      if (manager.isCancelled()) {
+        throw new Error("action cancelled");
+      }
+
+      const step = steps[index];
+      if (!step || typeof step !== "object" || Array.isArray(step)) {
+        throw new Error("invalid workflow step at index " + String(index));
+      }
+
+      const rawCommand = step.command || step.op || step.action;
+      if (typeof rawCommand !== "string" || rawCommand.length === 0) {
+        throw new Error("workflow step command is required at index " + String(index));
+      }
+
+      const resolvedArgs = resolveWorkflowValue(extractCommandArgs(step), scope);
+      const normalized = normalizeCommandName(rawCommand);
+      manager.setProgress("step " + String(index + 1) + "/" + String(steps.length) + ": " + normalized, {
+        action: "workflow",
+        label,
+        step: index + 1,
+        totalSteps: steps.length,
+        command: normalized
+      });
+
+      try {
+        const result = await executeDirectCommand(normalized, resolvedArgs, {
+          scope
+        });
+        const entry = {
+          index: index + 1,
+          command: normalized,
+          ok: true,
+          result
+        };
+        results.push(entry);
+        scope.last = result;
+        scope.results.push(entry);
+        if (typeof step.saveAs === "string" && step.saveAs.length > 0) {
+          scope.named[step.saveAs] = result;
+        }
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        const entry = {
+          index: index + 1,
+          command: normalized,
+          ok: false,
+          error: message
+        };
+        results.push(entry);
+        scope.last = entry;
+        scope.results.push(entry);
+        if (!continueOnError) {
+          throw new Error("workflow step " + String(index + 1) + " failed: " + message);
+        }
+      }
+
+      scope.memory = worldMemory.snapshot().memory;
+      scope.status = getStatusPayload();
+    }
+
+    const okCount = results.filter((entry) => entry.ok).length;
+    const failureCount = results.length - okCount;
+    worldMemory.addNote("workflow finished", "workflow", {
+      label,
+      okCount,
+      failureCount
+    });
+
+    return {
+      ok: failureCount === 0,
+      label,
+      stepCount: steps.length,
+      okCount,
+      failureCount,
+      results,
+      named: scope.named
+    };
+  });
+}
+
+function resolveAgentSessionId(body, fallbackRequired = true) {
+  const sessionId = body && typeof body.id === "string" && body.id.length > 0
+    ? body.id
+    : "";
+  if (sessionId) {
+    return sessionId;
+  }
+
+  const current = agentRuntime.snapshot().currentSessionId || "";
+  if (current) {
+    return current;
+  }
+
+  if (fallbackRequired) {
+    throw new Error("agent session id is required");
+  }
+  return "";
+}
+
+function getAgentContextBundle(sessionId) {
+  updateMemorySnapshot();
+  return {
+    capabilities: getCapabilitiesPayload(),
+    world: getFullStatePayload(),
+    memory: worldMemory.snapshot(),
+    agent: agentRuntime.snapshot(sessionId || undefined)
+  };
+}
+
+async function agentStart(body) {
+  const session = agentRuntime.createSession({
+    id: optionalStringValue(body, "id", ""),
+    label: optionalStringValue(body, "label", "agent-session"),
+    goal: optionalStringValue(body, "goal", ""),
+    mode: optionalStringValue(body, "mode", "llm_bridge"),
+    autoExecute: boolValue(body, "autoExecute", false),
+    systemPrompt: optionalStringValue(body, "systemPrompt", ""),
+    metadata: body && body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+      ? body.metadata
+      : {}
+  });
+
+  if (body && typeof body.message === "string" && body.message.length > 0) {
+    agentRuntime.addMessage(session.id, {
+      role: "user",
+      source: "operator",
+      content: body.message
+    });
+  }
+
+  worldMemory.addNote("agent session started", "agent", {
+    id: session.id,
+    label: session.label,
+    goal: session.goal
+  });
+
+  return {
+    ok: true,
+    session: agentRuntime.snapshot(session.id).session
+  };
+}
+
+async function agentMessage(body) {
+  const id = resolveAgentSessionId(body);
+  const message = agentRuntime.addMessage(id, {
+    role: optionalStringValue(body, "role", "user"),
+    source: optionalStringValue(body, "source", "operator"),
+    content: stringValue(body, "content")
+  });
+  return {
+    ok: true,
+    session: agentRuntime.snapshot(id).session,
+    message
+  };
+}
+
+async function agentPlan(body) {
+  const id = resolveAgentSessionId(body);
+  const mode = optionalStringValue(body, "mode", "replace");
+  const steps = Array.isArray(body.steps) ? body.steps : [];
+  if (mode === "append") {
+    agentRuntime.appendPlan(id, steps);
+  } else if (mode === "clear") {
+    agentRuntime.clearPlan(id);
+  } else {
+    agentRuntime.setPlan(id, steps, {
+      clearResults: boolValue(body, "clearResults", true)
+    });
+  }
+
+  if (body && typeof body.note === "string" && body.note.length > 0) {
+    agentRuntime.addMessage(id, {
+      role: "system",
+      source: "planner",
+      content: body.note
+    });
+  }
+
+  return {
+    ok: true,
+    session: agentRuntime.snapshot(id).session
+  };
+}
+
+async function agentPrompt(body) {
+  const id = resolveAgentSessionId(body);
+  return agentRuntime.buildPromptPayload(id, getAgentContextBundle(id));
+}
+
+async function agentAutoplan(body) {
+  const id = resolveAgentSessionId(body);
+  if (body && typeof body.message === "string" && body.message.length > 0) {
+    agentRuntime.addMessage(id, {
+      role: "user",
+      source: "operator",
+      content: body.message
+    });
+  }
+  const result = await agentRuntime.requestPlan(id, getAgentContextBundle(id));
+  worldMemory.addNote("agent llm planned workflow", "agent", {
+    id,
+    stepCount: result.session.plan.length
+  });
+  return result;
+}
+
+async function agentRun(body) {
+  const id = resolveAgentSessionId(body);
+  const session = agentRuntime.requireSession(id);
+  if (!Array.isArray(session.plan) || session.plan.length === 0) {
+    throw new Error("agent session plan is empty");
+  }
+
+  if (boolValue(body, "resetResults", true)) {
+    agentRuntime.clearResults(id);
+  }
+
+  agentRuntime.markRunning(id);
+  worldMemory.addNote("agent run started", "agent", {
+    id,
+    label: session.label,
+    stepCount: session.plan.length
+  });
+
+  try {
+    const workflow = await runWorkflow({
+      label: "agent:" + session.label,
+      steps: session.plan,
+      continueOnError: boolValue(body, "continueOnError", false)
+    });
+    agentRuntime.appendResults(id, workflow.results || []);
+    if (workflow.ok) {
+      agentRuntime.markCompleted(id);
+    } else {
+      agentRuntime.markFailed(id, "workflow completed with failures");
+    }
+    return {
+      ok: workflow.ok,
+      session: agentRuntime.snapshot(id).session,
+      workflow
+    };
+  } catch (error) {
+    agentRuntime.markFailed(id, error && error.message ? error.message : String(error));
+    throw error;
+  }
+}
+
+async function agentStep(body) {
+  const id = resolveAgentSessionId(body);
+  const session = agentRuntime.requireSession(id);
+  let command = optionalStringValue(body, "command", "");
+  let rawArgs = body && body.args && typeof body.args === "object" && !Array.isArray(body.args) ? body.args : {};
+  let index = -1;
+
+  if (!command) {
+    index = Array.isArray(session.results) ? session.results.length : 0;
+    if (!Array.isArray(session.plan) || index >= session.plan.length) {
+      throw new Error("no remaining agent step");
+    }
+    const step = session.plan[index];
+    command = step.command || step.op || step.action;
+    rawArgs = extractCommandArgs(step);
+  }
+
+  agentRuntime.markRunning(id);
+  try {
+    const scope = buildWorkflowScope("agent_step");
+    scope.named.session = session;
+    const result = await executeDirectCommand(command, rawArgs, {
+      scope
+    });
+    const entry = {
+      index: index >= 0 ? index + 1 : (Array.isArray(session.results) ? session.results.length + 1 : 1),
+      command: normalizeCommandName(command),
+      ok: true,
+      result
+    };
+    agentRuntime.appendResults(id, [entry]);
+    agentRuntime.markIdle(id);
+    return {
+      ok: true,
+      session: agentRuntime.snapshot(id).session,
+      step: entry
+    };
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    agentRuntime.appendResults(id, [{
+      index: index >= 0 ? index + 1 : (Array.isArray(session.results) ? session.results.length + 1 : 1),
+      command: normalizeCommandName(command),
+      ok: false,
+      error: message
+    }]);
+    agentRuntime.markFailed(id, message);
+    throw error;
+  }
+}
+
+async function agentStop(body) {
+  const id = resolveAgentSessionId(body);
+  agentRuntime.markStopped(id);
+  actionManager.cancel();
+  return {
+    ok: true,
+    session: agentRuntime.snapshot(id).session
+  };
+}
+
+async function handleRealtimeMessage(client, message) {
+  const type = normalizeCommandName(message && message.type ? message.type : "");
+
+  switch (type) {
+    case "command":
+      return runDirectControl({
+        command: message.command,
+        args: message.args
+      });
+    case "workflow":
+      return runWorkflow({
+        label: message.label,
+        steps: Array.isArray(message.steps) ? message.steps : [],
+        continueOnError: Boolean(message.continueOnError)
+      });
+    case "agent": {
+      const op = normalizeCommandName(message.op || message.command || "");
+      const args = message.args && typeof message.args === "object" && !Array.isArray(message.args)
+        ? message.args
+        : {};
+      switch (op) {
+        case "start":
+          return agentStart(args);
+        case "status":
+          return agentRuntime.snapshot(args.id || undefined);
+        case "message":
+          return agentMessage(args);
+        case "plan":
+          return agentPlan(args);
+        case "prompt":
+          return agentPrompt(args);
+        case "autoplan":
+          return agentAutoplan(args);
+        case "run":
+          return agentRun(args);
+        case "step":
+          return agentStep(args);
+        case "stop":
+          return agentStop(args);
+        default:
+          throw new Error("unsupported realtime agent op: " + op);
+      }
+    }
+    case "read_status":
+    case "status":
+      return readStatusPayload();
+    default:
+      throw new Error("unsupported realtime message type: " + type);
+  }
+}
+
+async function setInputCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("set_input requires mod_client backend");
+  }
+
+  const payload = await requireModClient().input({
+    keys: body && body.keys && typeof body.keys === "object" && !Array.isArray(body.keys) ? body.keys : undefined,
+    clearMovement: boolValue(body || {}, "clearMovement", false),
+    yaw: "yaw" in body ? numberValue(body, "yaw") : undefined,
+    pitch: "pitch" in body ? numberValue(body, "pitch") : undefined,
+    deltaYaw: "deltaYaw" in body ? numberValue(body, "deltaYaw") : undefined,
+    deltaPitch: "deltaPitch" in body ? numberValue(body, "deltaPitch") : undefined,
+    hotbar: "hotbar" in body ? Math.floor(numberValue(body, "hotbar")) : undefined
+  });
+  state.lastError = "";
+  if (payload && typeof payload === "object" && payload.selectedHotbarSlot && state.modCache.status) {
+    state.modCache.status.selectedHotbarSlot = payload.selectedHotbarSlot;
+  }
+  return {
+    ok: true,
+    input: payload
+  };
+}
+
+async function tapKeyCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("tap_key requires mod_client backend");
+  }
+
+  const key = stringValue(body, "key");
+  const durationMs = Math.max(10, Math.floor(numberValue(body, "durationMs", 120)));
+  const payload = await requireModClient().tap(key, durationMs);
+  state.lastError = "";
+  return {
+    ok: true,
+    key,
+    durationMs,
+    payload
+  };
+}
+
+async function releaseAllCommand() {
+  if (!isModClientDriver()) {
+    throw new Error("release_all requires mod_client backend");
+  }
+
+  const payload = await requireModClient().releaseAll();
+  state.lastError = "";
+  return {
+    ok: true,
+    payload
+  };
+}
+
+async function interactBlockCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("interact_block requires mod_client backend");
+  }
+
+  const payload = {
+    x: Math.floor(numberValue(body, "x")),
+    y: Math.floor(numberValue(body, "y")),
+    z: Math.floor(numberValue(body, "z")),
+    face: optionalStringValue(body, "face", "up"),
+    hand: optionalStringValue(body, "hand", "main")
+  };
+
+  if ("hitX" in body) {
+    payload.hitX = numberValue(body, "hitX");
+  }
+  if ("hitY" in body) {
+    payload.hitY = numberValue(body, "hitY");
+  }
+  if ("hitZ" in body) {
+    payload.hitZ = numberValue(body, "hitZ");
+  }
+  if ("insideBlock" in body) {
+    payload.insideBlock = boolValue(body, "insideBlock", false);
+  }
+
+  const result = await requireModClient().interactBlock(payload);
+  state.lastError = "";
+  return {
+    ok: true,
+    interaction: result
+  };
+}
+
+async function readContainerCommand(body) {
+  if (!isModClientDriver()) {
+    return readContainer(body);
+  }
+
+  let position = null;
+  if ("x" in body && "y" in body && "z" in body) {
+    position = {
+      x: Math.floor(numberValue(body, "x")),
+      y: Math.floor(numberValue(body, "y")),
+      z: Math.floor(numberValue(body, "z"))
+    };
+    await interactBlockCommand({
+      ...body,
+      ...position,
+      face: optionalStringValue(body, "face", "up"),
+      hand: optionalStringValue(body, "hand", "main")
+    });
+    await sleep(Math.max(60, Math.floor(numberValue(body, "openDelayMs", 150))));
+  }
+
+  const payload = await readContainerPayload();
+  rememberModContainerObservation(payload, position, "read_container");
+  return {
+    ok: true,
+    block: position,
+    container: payload
+  };
+}
+
+async function readScreenCommand() {
+  return readScreenPayload();
+}
+
+async function screenshotCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("screenshot requires mod_client backend");
+  }
+
+  const payload = await requireModClient().screenshot(optionalStringValue(body, "name", ""));
+  state.lastError = "";
+  return payload;
+}
+
+async function guiClickCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_click requires mod_client backend");
+  }
+
+  return requireModClient().guiClick({
+    x: numberValue(body, "x"),
+    y: numberValue(body, "y"),
+    button: Math.floor(numberValue(body, "button", 0)),
+    doubleClick: boolValue(body, "doubleClick", false)
+  });
+}
+
+async function guiReleaseCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_release requires mod_client backend");
+  }
+
+  return requireModClient().guiRelease({
+    x: numberValue(body, "x"),
+    y: numberValue(body, "y"),
+    button: Math.floor(numberValue(body, "button", 0))
+  });
+}
+
+async function guiScrollCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_scroll requires mod_client backend");
+  }
+
+  return requireModClient().guiScroll({
+    x: numberValue(body, "x"),
+    y: numberValue(body, "y"),
+    deltaX: numberValue(body, "deltaX", 0),
+    deltaY: numberValue(body, "deltaY", 0)
+  });
+}
+
+async function guiKeyCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_key requires mod_client backend");
+  }
+
+  return requireModClient().guiKey({
+    key: Math.floor(numberValue(body, "key")),
+    scancode: Math.floor(numberValue(body, "scancode", 0)),
+    modifiers: Math.floor(numberValue(body, "modifiers", 0))
+  });
+}
+
+async function guiTypeCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_type requires mod_client backend");
+  }
+  return requireModClient().guiType(stringValue(body, "text"));
+}
+
+async function guiClickWidgetCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("gui_click_widget requires mod_client backend");
+  }
+
+  return requireModClient().guiClickWidget({
+    index: Math.floor(numberValue(body, "index")),
+    button: Math.floor(numberValue(body, "button", 0))
+  });
+}
+
+async function guiCloseCommand() {
+  if (!isModClientDriver()) {
+    throw new Error("gui_close requires mod_client backend");
+  }
+  return requireModClient().guiClose();
+}
+
+async function debugFakePlayerListCommand() {
+  return readFakePlayersPayload();
+}
+
+async function debugFakePlayerSpawnCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("debug_fake_player_spawn requires mod_client backend");
+  }
+  return requireModClient().spawnFakePlayer(body);
+}
+
+async function debugFakePlayerMoveCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("debug_fake_player_move requires mod_client backend");
+  }
+  return requireModClient().moveFakePlayer(body);
+}
+
+async function debugFakePlayerRemoveCommand(body) {
+  if (!isModClientDriver()) {
+    throw new Error("debug_fake_player_remove requires mod_client backend");
+  }
+  return requireModClient().removeFakePlayer(stringValue(body, "name"));
+}
+
+async function moveTo(body) {
+  return actionManager.run("move_to", async () => {
+    return moveToDirect(body);
+  });
+}
+
+async function lookAt(body) {
+  const x = numberValue(body, "x");
+  const y = numberValue(body, "y");
+  const z = numberValue(body, "z");
+
+  if (isModClientDriver()) {
+    const status = await readStatusPayload();
+    if (!status.inWorld) {
+      throw new Error("look_at requires the mod-client to be in a world");
+    }
+    const angles = calculateLookAngles(status, { x, y, z });
+    const payload = await requireModClient().look({
+      yaw: angles.yaw,
+      pitch: angles.pitch
+    });
+    state.lastError = "";
+    if (state.modCache.status && typeof state.modCache.status === "object") {
+      state.modCache.status.yaw = angles.yaw;
+      state.modCache.status.pitch = angles.pitch;
+    }
+    return {
+      ok: true,
+      lookedAt: { x, y, z },
+      yaw: angles.yaw,
+      pitch: angles.pitch,
+      payload
+    };
+  }
+
+  const bot = requireBot();
   const force = boolValue(body, "force", true);
 
   await bot.lookAt(new Vec3(x, y, z), force);
@@ -2946,6 +5886,28 @@ async function lookAt(body) {
 }
 
 async function useItem(body) {
+  if (isModClientDriver()) {
+    if ("x" in body && "y" in body && "z" in body) {
+      const interaction = await interactBlockCommand(body);
+      return {
+        ok: true,
+        target: {
+          x: Math.floor(numberValue(body, "x")),
+          y: Math.floor(numberValue(body, "y")),
+          z: Math.floor(numberValue(body, "z"))
+        },
+        interaction: interaction.interaction
+      };
+    }
+    const payload = await requireModClient().interactItem(optionalStringValue(body, "hand", "main"));
+    state.lastError = "";
+    return {
+      ok: true,
+      activatedItem: true,
+      payload
+    };
+  }
+
   const bot = requireBot();
   if ("x" in body && "y" in body && "z" in body) {
     const x = numberValue(body, "x");
@@ -4052,6 +7014,7 @@ async function buildReferencePathChain(body) {
   return actionManager.run("build_reference_path_chain", async (manager) => {
     const bot = requireBot();
     const connectOptions = state.botOptions || config.bot;
+    const manualOnly = boolValue(body, "manualOnly", true);
     const segmentCount = Math.max(2, Math.floor(numberValue(body, "segmentCount", 6)));
     const segmentLength = Math.max(6, Math.floor(numberValue(body, "segmentLength", 10)));
     const pathWidth = Math.max(5, Math.floor(numberValue(body, "pathWidth", 7)));
@@ -4076,12 +7039,16 @@ async function buildReferencePathChain(body) {
     const leafItem = stringValue(body, "leafItem", "oak_leaves");
     const lanternItem = stringValue(body, "lanternItem", "lantern");
     const shrubItem = stringValue(body, "shrubItem", "moss_block");
+    const inventoryMode = manualOnly ? "creative_manual" : "";
 
     if (!["auto", "lanes", "grid", "round_robin"].includes(workerMode)) {
       throw new Error("invalid workerMode: " + workerMode);
     }
     if (Math.abs(dirX) + Math.abs(dirZ) !== 1) {
       throw new Error("dirX/dirZ must describe one horizontal axis");
+    }
+    if (manualOnly && !isCreativeMode(bot)) {
+      throw new Error("manual path chain requires the bot to be in creative mode");
     }
 
     let originX;
@@ -4120,11 +7087,14 @@ async function buildReferencePathChain(body) {
       shrubItem
     });
     const placements = pathPlan.placements;
-    const stageOrder = ["ground", "posts", "decor"];
+    const stageOrder = ["ground", "posts", "decor_base", "decor_leaf", "decor_top", "decor_finish"];
     const stageTargets = {
       ground: pathPlan.center,
       posts: { x: pathPlan.center.x, y: pathPlan.center.y + 2, z: pathPlan.center.z },
-      decor: { x: pathPlan.center.x, y: pathPlan.center.y + 4, z: pathPlan.center.z }
+      decor_base: { x: pathPlan.center.x, y: pathPlan.center.y + 4, z: pathPlan.center.z },
+      decor_leaf: { x: pathPlan.center.x, y: pathPlan.center.y + 4, z: pathPlan.center.z },
+      decor_top: { x: pathPlan.center.x, y: pathPlan.center.y + 5, z: pathPlan.center.z },
+      decor_finish: { x: pathPlan.center.x, y: pathPlan.center.y + 4, z: pathPlan.center.z }
     };
     const results = [];
     const helperBots = [];
@@ -4133,7 +7103,7 @@ async function buildReferencePathChain(body) {
     let failureCount = 0;
     const workerFallbackTarget = {
       x: pathPlan.center.x,
-      y: pathPlan.center.y + 1,
+      y: pathPlan.center.y,
       z: pathPlan.center.z
     };
 
@@ -4175,18 +7145,14 @@ async function buildReferencePathChain(body) {
       });
     }
 
-    async function teleportWorkerNearChunk(workerBot, bounds, fallbackTarget) {
+    async function moveWorkerNearChunk(workerBot, bounds, fallbackTarget) {
       const target = bounds ? {
         x: bounds.minX,
-        y: bounds.maxY + 2,
+        y: workerFallbackTarget.y,
         z: bounds.minZ
       } : fallbackTarget;
 
-      await runBotCommand(
-        bot,
-        "/tp " + workerBot.username + " " + String(target.x) + " " + String(target.y) + " " + String(target.z)
-      );
-      await sleep(250);
+      await ensureNear(workerBot, target.x, target.y, target.z, 2);
     }
 
     function splitPlacementsForWorkers(list, botCount) {
@@ -4323,7 +7289,9 @@ async function buildReferencePathChain(body) {
             placeDelayMs,
             replace: true,
             skipInventoryCheck: true,
-            commandBot: bot
+            commandBot: bot,
+            allowCommands: !manualOnly,
+            inventoryMode
           });
           results.push({
             ...result,
@@ -4413,10 +7381,11 @@ async function buildReferencePathChain(body) {
           continue;
         }
 
-        await teleportWorkerNearChunk(workerBot, stageWorkers[index].bounds, stageTargets[stageName] || workerFallbackTarget);
-        await runBotCommand(bot, "/clear " + workerBot.username);
+        await moveWorkerNearChunk(workerBot, stageWorkers[index].bounds, stageTargets[stageName] || workerFallbackTarget);
         await ensurePlacementInventory(workerBot, chunk, null, {
-          commandBot: bot
+          commandBot: bot,
+          allowCommands: !manualOnly,
+          inventoryMode
         });
       }
 
@@ -4440,9 +7409,9 @@ async function buildReferencePathChain(body) {
       const target = stageTargets[stageName];
       if (target) {
         try {
-          await ensureNear(bot, target.x, target.y, target.z, 1);
+          await ensureNear(bot, target.x, workerFallbackTarget.y, target.z, 1);
         } catch (error) {
-          await runBotCommand(bot, "/tp " + bot.username + " " + String(target.x) + " " + String(target.y) + " " + String(target.z));
+          logMessage("failed to walk near stage target: " + (error && error.message ? error.message : String(error)), "Error");
         }
       }
 
@@ -4467,12 +7436,16 @@ async function buildReferencePathChain(body) {
           continue;
         }
 
+        let helperBot = null;
         try {
-          const helperBot = await connectAuxiliaryBot(connectOptions, helperName);
+          helperBot = await connectAuxiliaryBot(connectOptions, helperName);
+          if (manualOnly && !isCreativeMode(helperBot)) {
+            await disconnectAuxiliaryBots([helperBot]);
+            throw new Error("helper bot is not in creative mode");
+          }
           helperBots.push(helperBot);
           workerBots.push(helperBot);
-          await runBotCommand(bot, "/gamemode creative " + helperName);
-          await teleportWorkerNearChunk(helperBot, null, workerFallbackTarget);
+          await moveWorkerNearChunk(helperBot, null, workerFallbackTarget);
         } catch (error) {
           logMessage("failed to connect aux bot " + helperName + ": " + (error && error.message ? error.message : String(error)), "Error");
         }
@@ -4627,7 +7600,7 @@ async function farmStoreFive(body) {
       throw new Error("farm water floor missing at " + blockKey(centerX, waterFloorY, centerZ));
     }
 
-    const waterResult = await placeWaterSourceByHand(bot, waterItem, centerX, waterY, centerZ, range, useDelayMs);
+    const waterResult = await placeWaterSourceByHand(bot, waterItem, centerX, waterY, centerZ, range, useDelayMs, inventoryOptions);
     results.waterPlaced = true;
     results.waterMethod = waterResult.method;
 
@@ -4752,6 +7725,269 @@ async function farmStoreFive(body) {
   });
 }
 
+async function fishCookEat(body) {
+  return actionManager.run("fish_cook_eat", async (manager) => {
+    const bot = requireBot();
+    const manualOnly = boolValue(body, "manualOnly", true);
+    const range = numberValue(body, "range", 4);
+    const useDelayMs = numberValue(body, "useDelayMs", 200);
+    const fishTimeoutMs = numberValue(body, "fishTimeoutMs", 45000);
+    const fishAttempts = Math.max(1, Math.floor(numberValue(body, "fishAttempts", 8)));
+    const searchRadius = numberValue(body, "searchRadius", 96);
+    const fishingRodItem = stringValue(body, "fishingRodItem", "fishing_rod");
+    const chestItem = stringValue(body, "chestItem", "chest");
+    const furnaceItem = stringValue(body, "furnaceItem", "furnace");
+    const fuelItem = stringValue(body, "fuelItem", "coal");
+    const waterItem = stringValue(body, "waterItem", "water_bucket");
+    const rawFishNames = ["cod", "salmon"];
+    const cookedFishByRaw = {
+      cod: "cooked_cod",
+      salmon: "cooked_salmon"
+    };
+    const inventoryMode = manualOnly ? "creative_manual" : "";
+
+    if (manualOnly && !isCreativeMode(bot)) {
+      throw new Error("fish_cook_eat manual mode requires creative mode");
+    }
+
+    let originX;
+    let originY;
+    let originZ;
+    if ("x" in body && "y" in body && "z" in body) {
+      originX = Math.floor(numberValue(body, "x"));
+      originY = Math.floor(numberValue(body, "y"));
+      originZ = Math.floor(numberValue(body, "z"));
+    } else {
+      const found = findFlatBuildOrigin(bot, {
+        width: 12,
+        depth: 12,
+        searchRadius
+      });
+      originX = found.x;
+      originY = found.y;
+      originZ = found.z;
+    }
+
+    const pondMinX = originX + 2;
+    const pondMinZ = originZ + 2;
+    const pondSize = 3;
+    const chestX = originX + 7;
+    const chestY = originY + 1;
+    const chestZ = originZ + 2;
+    const furnaceX = originX + 7;
+    const furnaceY = originY + 1;
+    const furnaceZ = originZ + 4;
+    const fishingSpot = {
+      x: pondMinX + 1,
+      y: originY + 1,
+      z: pondMinZ + pondSize + 1,
+      lookX: pondMinX + 1.5,
+      lookY: originY + 0.25,
+      lookZ: pondMinZ + 1.5
+    };
+    const results = {
+      pondDug: 0,
+      waterPlaced: 0,
+      fishAttempts: 0,
+      caughtItem: "",
+      caughtCounts: {},
+      chestPlaced: false,
+      storedFish: {},
+      furnacePlaced: false,
+      smeltedItem: "",
+      ateCookedFish: false
+    };
+
+    function setProgress(message, extra) {
+      manager.setProgress(message, {
+        action: "fish_cook_eat",
+        origin: {
+          x: originX,
+          y: originY,
+          z: originZ
+        },
+        ...(extra || {})
+      });
+    }
+
+    const inventoryOptions = {
+      allowCommands: !manualOnly,
+      inventoryMode
+    };
+
+    setProgress("preparing items");
+    await ensureInventoryItem(bot, fishingRodItem, 1, inventoryOptions);
+    await ensureInventoryItem(bot, chestItem, 1, inventoryOptions);
+    await ensureInventoryItem(bot, furnaceItem, 1, inventoryOptions);
+    await ensureInventoryItem(bot, fuelItem, 1, inventoryOptions);
+    await ensureInventoryItem(bot, waterItem, 1, inventoryOptions);
+
+    const baseFishCounts = Object.fromEntries(rawFishNames.map((itemName) => [itemName, countInventoryItem(bot, itemName)]));
+
+    setProgress("digging pond");
+    for (let dz = 0; dz < pondSize; dz += 1) {
+      for (let dx = 0; dx < pondSize; dx += 1) {
+        const x = pondMinX + dx;
+        const z = pondMinZ + dz;
+        const cleared = await clearBlockIfNeeded(bot, x, originY, z, range, useDelayMs);
+        if (cleared.cleared) {
+          results.pondDug += 1;
+        }
+      }
+    }
+
+    setProgress("filling pond");
+    for (let dz = 0; dz < pondSize; dz += 1) {
+      for (let dx = 0; dx < pondSize; dx += 1) {
+        const x = pondMinX + dx;
+        const z = pondMinZ + dz;
+        const waterResult = await placeWaterSourceByHand(bot, waterItem, x, originY, z, range, useDelayMs, inventoryOptions);
+        if (!waterResult.skipped) {
+          results.waterPlaced += 1;
+        }
+      }
+    }
+
+    setProgress("fishing");
+    const fishingResult = await fishUntilCookable(bot, {
+      fishingSpot,
+      maxAttempts: fishAttempts,
+      castTimeoutMs: fishTimeoutMs,
+      rawFishNames,
+      rodItem: fishingRodItem,
+      allowCommands: !manualOnly,
+      inventoryMode
+    });
+    results.fishAttempts = fishingResult.attempts;
+    results.caughtItem = fishingResult.caughtItem;
+    results.caughtCounts = Object.fromEntries(rawFishNames.map((itemName) => [
+      itemName,
+      Math.max(0, (fishingResult.totals[itemName] || 0) - baseFishCounts[itemName])
+    ]));
+
+    const cookRawItem = rawFishNames.find((itemName) => results.caughtCounts[itemName] > 0) || "";
+    if (!cookRawItem) {
+      throw new Error("failed to catch cookable fish after " + String(results.fishAttempts) + " attempts");
+    }
+
+    setProgress("placing chest");
+    await clearBlockIfNeeded(bot, chestX, chestY, chestZ, range, useDelayMs);
+    await placeBlockByHand(bot, {
+      x: chestX,
+      y: chestY,
+      z: chestZ,
+      item: chestItem
+    }, {
+      range,
+      placeDelayMs: useDelayMs,
+      replace: false,
+      allowCommands: !manualOnly,
+      inventoryMode
+    });
+    results.chestPlaced = true;
+
+    setProgress("storing fish");
+    await ensureNear(bot, chestX, chestY, chestZ, range, {
+      lookAtBlock: true,
+      reach: Math.max(4.5, range)
+    });
+    const chestBlock = bot.blockAt(new Vec3(chestX, chestY, chestZ));
+    if (!chestBlock || chestBlock.name !== "chest") {
+      throw new Error("chest block not found at " + blockKey(chestX, chestY, chestZ));
+    }
+
+    const container = await bot.openContainer(chestBlock);
+    try {
+      for (const itemName of rawFishNames) {
+        const caughtCount = results.caughtCounts[itemName];
+        if (caughtCount > 0) {
+          await depositContainerItem(container, bot, itemName, caughtCount);
+          results.storedFish[itemName] = caughtCount;
+        }
+      }
+      await withdrawContainerItem(container, bot, cookRawItem, 1);
+    } finally {
+      container.close();
+      await sleep(150);
+    }
+
+    setProgress("placing furnace");
+    await clearBlockIfNeeded(bot, furnaceX, furnaceY, furnaceZ, range, useDelayMs);
+    await placeBlockByHand(bot, {
+      x: furnaceX,
+      y: furnaceY,
+      z: furnaceZ,
+      item: furnaceItem
+    }, {
+      range,
+      placeDelayMs: useDelayMs,
+      replace: false,
+      allowCommands: !manualOnly,
+      inventoryMode
+    });
+    results.furnacePlaced = true;
+
+    setProgress("smelting fish");
+    await ensureNear(bot, furnaceX, furnaceY, furnaceZ, range, {
+      lookAtBlock: true,
+      reach: Math.max(4.5, range)
+    });
+    const furnaceBlock = bot.blockAt(new Vec3(furnaceX, furnaceY, furnaceZ));
+    if (!furnaceBlock || furnaceBlock.name !== furnaceItem) {
+      throw new Error("furnace block not found at " + blockKey(furnaceX, furnaceY, furnaceZ));
+    }
+
+    const furnace = await bot.openFurnace(furnaceBlock);
+    const cookedItem = cookedFishByRaw[cookRawItem];
+    try {
+      await furnace.putInput(bot.registry.itemsByName[cookRawItem].id, null, 1);
+      await furnace.putFuel(bot.registry.itemsByName[fuelItem].id, null, 1);
+      const output = await waitForFurnaceOutput(furnace, cookedItem, fishTimeoutMs);
+      if (!output || output.name !== cookedItem) {
+        throw new Error("furnace did not produce " + cookedItem);
+      }
+      await furnace.takeOutput();
+    } finally {
+      furnace.close();
+      await sleep(150);
+    }
+    results.smeltedItem = cookedItem;
+
+    setProgress("eating cooked fish");
+    await waitForInventoryItemCount(bot, cookedItem, 1, 5000);
+    await equipItemByName(bot, cookedItem);
+    await bot.consume();
+    results.ateCookedFish = true;
+
+    return {
+      ok: true,
+      action: "fish_cook_eat",
+      origin: {
+        x: originX,
+        y: originY,
+        z: originZ
+      },
+      pond: {
+        x: pondMinX,
+        y: originY,
+        z: pondMinZ,
+        size: pondSize
+      },
+      chest: {
+        x: chestX,
+        y: chestY,
+        z: chestZ
+      },
+      furnace: {
+        x: furnaceX,
+        y: furnaceY,
+        z: furnaceZ
+      },
+      results
+    };
+  });
+}
+
 async function runAction(body) {
   const action = stringValue(body, "action");
   switch (action) {
@@ -4779,6 +8015,11 @@ async function runAction(body) {
     case "build_path_chain":
     case "build-path-chain":
       return buildReferencePathChain(body);
+    case "fish_cook_eat":
+    case "fish-cook-eat":
+    case "pond_fish_smelt_eat":
+    case "pond-fish-smelt-eat":
+      return fishCookEat(body);
     case "farm_store_five":
     case "farm-store-five":
       return farmStoreFive(body);
@@ -4800,13 +8041,31 @@ async function runAction(body) {
 }
 
 function getFullStatePayload() {
+  if (isModClientDriver()) {
+    return {
+      ok: true,
+      status: getStatusPayload(),
+      players: getPlayersPayload(),
+      inventory: getInventoryPayload(),
+      chat: state.modCache.chat ? clone(state.modCache.chat) : { ok: true, messages: [], typed: [] },
+      screen: normalizeModScreenPayload(state.modCache.screen),
+      target: normalizeModTargetPayload(state.modCache.target, 6),
+      container: normalizeModContainerPayload(state.modCache.container),
+      action: actionManager.snapshot(),
+      memory: worldMemory.snapshot(),
+      agent: agentRuntime.snapshot()
+    };
+  }
+
   return {
     ok: true,
     status: getStatusPayload(),
     players: getPlayersPayload(),
     inventory: getInventoryPayload(),
     chat: chatHistory.get(-1, 20),
-    action: actionManager.snapshot()
+    action: actionManager.snapshot(),
+    memory: worldMemory.snapshot(),
+    agent: agentRuntime.snapshot()
   };
 }
 
@@ -4839,29 +8098,73 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (request.method === "GET" && url.pathname === "/status") {
-      sendJson(response, 200, getStatusPayload());
+      sendJson(response, 200, await readStatusPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/capabilities") {
+      sendJson(response, 200, getCapabilitiesPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/agent/status") {
+      const id = url.searchParams.get("id") || undefined;
+      sendJson(response, 200, agentRuntime.snapshot(id));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/agent/sessions") {
+      sendJson(response, 200, agentRuntime.snapshot());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/agent/prompt") {
+      const id = url.searchParams.get("id") || undefined;
+      sendJson(response, 200, await agentPrompt({
+        id
+      }));
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/full-state") {
-      sendJson(response, 200, getFullStatePayload());
+      sendJson(response, 200, await readFullStatePayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/memory") {
+      sendJson(response, 200, worldMemory.snapshot());
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/chat") {
       const since = Number(url.searchParams.get("since") || "-1");
       const limit = Number(url.searchParams.get("limit") || "50");
-      sendJson(response, 200, chatHistory.get(since, limit));
+      sendJson(response, 200, await readChatPayload(since, limit));
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/players") {
-      sendJson(response, 200, getPlayersPayload());
+      sendJson(response, 200, await readPlayersPayload());
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/inventory") {
-      sendJson(response, 200, getInventoryPayload());
+      sendJson(response, 200, await readInventoryPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/screen") {
+      sendJson(response, 200, await readScreenPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/container") {
+      sendJson(response, 200, await readContainerPayload());
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/target") {
+      sendJson(response, 200, await readTargetPayload(Number(url.searchParams.get("maxDistance") || "6")));
       return;
     }
 
@@ -4872,7 +8175,12 @@ const server = http.createServer(async (request, response) => {
       if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
         throw new Error("x, y and z query params are required");
       }
-      sendJson(response, 200, getBlockPayload(x, y, z));
+      sendJson(response, 200, await readBlockPayload(x, y, z));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/debug/fake-player") {
+      sendJson(response, 200, await readFakePlayersPayload());
       return;
     }
 
@@ -4893,6 +8201,62 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/chat") {
       sendJson(response, 200, await sendChat(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/start") {
+      sendJson(response, 200, await agentStart(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/message") {
+      sendJson(response, 200, await agentMessage(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/plan") {
+      sendJson(response, 200, await agentPlan(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/autoplan") {
+      sendJson(response, 200, await agentAutoplan(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/run") {
+      sendJson(response, 200, await agentRun(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/step") {
+      sendJson(response, 200, await agentStep(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/agent/stop") {
+      sendJson(response, 200, await agentStop(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/memory/note") {
+      sendJson(response, 200, await executeDirectCommand("memory_note", body, {
+        scope: buildWorkflowScope("memory_note")
+      }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/memory/waypoint") {
+      sendJson(response, 200, await executeDirectCommand("memory_waypoint", body, {
+        scope: buildWorkflowScope("memory_waypoint")
+      }));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/memory/context") {
+      sendJson(response, 200, await executeDirectCommand("memory_context", body, {
+        scope: buildWorkflowScope("memory_context")
+      }));
       return;
     }
 
@@ -4921,8 +8285,98 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/input") {
+      sendJson(response, 200, await setInputCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/tap") {
+      sendJson(response, 200, await tapKeyCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/release-all") {
+      sendJson(response, 200, await releaseAllCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/interact/item") {
+      sendJson(response, 200, await useItem(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/interact/block") {
+      sendJson(response, 200, await interactBlockCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/click") {
+      sendJson(response, 200, await guiClickCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/release") {
+      sendJson(response, 200, await guiReleaseCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/scroll") {
+      sendJson(response, 200, await guiScrollCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/key") {
+      sendJson(response, 200, await guiKeyCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/type") {
+      sendJson(response, 200, await guiTypeCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/click-widget") {
+      sendJson(response, 200, await guiClickWidgetCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/gui/close") {
+      sendJson(response, 200, await guiCloseCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/screenshot") {
+      sendJson(response, 200, await screenshotCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/debug/fake-player/spawn") {
+      sendJson(response, 200, await debugFakePlayerSpawnCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/debug/fake-player/move") {
+      sendJson(response, 200, await debugFakePlayerMoveCommand(body));
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/debug/fake-player/remove") {
+      sendJson(response, 200, await debugFakePlayerRemoveCommand(body));
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/place") {
       sendJson(response, 200, await placeItem(body));
+      return;
+    }
+
+    if (request.method === "POST" && (url.pathname === "/control/run" || url.pathname === "/command/run")) {
+      sendJson(response, 200, await runDirectControl(body));
+      return;
+    }
+
+    if (request.method === "POST" && (url.pathname === "/workflow/run" || url.pathname === "/sequence/run")) {
+      sendJson(response, 200, await runWorkflow(body));
       return;
     }
 
@@ -4947,6 +8401,40 @@ const server = http.createServer(async (request, response) => {
       ok: false,
       error: message
     });
+  }
+});
+
+realtimeHub = new RealtimeHub(server, {
+  authenticate(request, url) {
+    const headerToken = request.headers["x-auth-token"];
+    const queryToken = url.searchParams.get("token");
+    ensureProvidedToken(headerToken || queryToken || "");
+  },
+  getCapabilities() {
+    return getCapabilitiesPayload();
+  },
+  onConnect(client) {
+    realtimeHub.send(client.id, {
+      type: "event",
+      channel: "status",
+      payload: getStatusPayload()
+    });
+    realtimeHub.send(client.id, {
+      type: "event",
+      channel: "agent",
+      payload: agentRuntime.snapshot()
+    });
+    realtimeHub.send(client.id, {
+      type: "event",
+      channel: "memory",
+      payload: {
+        type: "memory",
+        summary: worldMemory.summary()
+      }
+    });
+  },
+  onMessage(client, message) {
+    return handleRealtimeMessage(client, message);
   }
 });
 

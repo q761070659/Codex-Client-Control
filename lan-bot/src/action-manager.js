@@ -2,6 +2,7 @@
 
 class ActionManager {
   constructor() {
+    this.listeners = new Set();
     this.active = false;
     this.label = "Idle";
     this.state = "idle";
@@ -11,6 +12,28 @@ class ActionManager {
     this.startedAt = 0;
     this.cancelRequested = false;
     this.cancelHook = null;
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== "function") {
+      return () => {};
+    }
+
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  emit() {
+    const snapshot = this.snapshot();
+    for (const listener of this.listeners) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        // ignore listener errors
+      }
+    }
   }
 
   setCancelHook(cancelHook) {
@@ -50,6 +73,7 @@ class ActionManager {
       this.details = details;
     }
 
+    this.emit();
     return this.snapshot();
   }
 
@@ -66,6 +90,7 @@ class ActionManager {
     this.details = null;
     this.startedAt = Date.now();
     this.cancelRequested = false;
+    this.emit();
 
     try {
       const result = await executor(this);
@@ -78,10 +103,12 @@ class ActionManager {
       this.error = error && error.message ? error.message : String(error);
       throw error;
     } finally {
+      this.emit();
       this.active = false;
       this.label = "Idle";
       this.startedAt = 0;
       this.cancelRequested = false;
+      this.emit();
     }
   }
 
@@ -92,6 +119,7 @@ class ActionManager {
     if (this.cancelHook) {
       this.cancelHook();
     }
+    this.emit();
     return this.snapshot();
   }
 }

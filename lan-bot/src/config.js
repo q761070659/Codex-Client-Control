@@ -23,13 +23,34 @@ function defaultConfig() {
     bindHost: "127.0.0.1",
     bindPort: 47863,
     token: crypto.randomUUID(),
+    agent: {
+      maxSessions: 8,
+      autoSaveDebounceMs: 200,
+      systemPrompt: "You are Codex LAN Agent. Observe Minecraft state, remember important places and objects, and respond with compact JSON plans that use the available direct commands.",
+      llm: {
+        enabled: false,
+        provider: "openai_compatible",
+        baseUrl: "",
+        model: "",
+        apiKeyEnv: "OPENAI_API_KEY",
+        headers: {}
+      }
+    },
     bot: {
+      driver: "auto",
       host: "127.0.0.1",
       port: -1,
       username: "CodexLanBot",
       auth: "offline",
       version: "auto",
       connectTimeoutMs: 20000
+    },
+    modClient: {
+      host: "",
+      port: 0,
+      token: "",
+      configPath: "",
+      bootstrapLogPath: ""
     }
   };
 }
@@ -58,9 +79,21 @@ function loadConfig(startDir) {
   const config = {
     ...defaults,
     ...parsed,
+    agent: {
+      ...defaults.agent,
+      ...(parsed.agent || {}),
+      llm: {
+        ...defaults.agent.llm,
+        ...((parsed.agent && parsed.agent.llm) || {})
+      }
+    },
     bot: {
       ...defaults.bot,
       ...(parsed.bot || {})
+    },
+    modClient: {
+      ...defaults.modClient,
+      ...(parsed.modClient || {})
     }
   };
 
