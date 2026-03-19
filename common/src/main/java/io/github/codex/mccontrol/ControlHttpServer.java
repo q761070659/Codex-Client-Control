@@ -40,6 +40,30 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+/**
+ * HTTP/WebSocket 控制服务器，提供远程控制 Minecraft 客户端的 API。
+ *
+ * <p>此服务器监听配置指定的主机和端口，提供两类接口：</p>
+ * <ul>
+ *   <li><b>HTTP REST API</b> - 用于查询状态和执行操作</li>
+ *   <li><b>WebSocket API</b> - 用于实时订阅状态更新和高效的双向通信</li>
+ * </ul>
+ *
+ * <p>主要功能包括：</p>
+ * <ul>
+ *   <li>玩家状态查询（位置、血量、视角等）</li>
+ *   <li>GUI 自动化控制（点击、输入、拖拽）</li>
+ *   <li>键盘/鼠标输入模拟</li>
+ *   <li>聊天消息发送</li>
+ *   <li>调试用假玩家管理</li>
+ *   <li>动作序列执行（可中断的步骤序列）</li>
+ * </ul>
+ *
+ * <p>所有 API 都需要通过 Token 进行身份验证，Token 可在配置文件中设置。</p>
+ *
+ * @see ControlBootstrap
+ * @see MinecraftBridge
+ */
 public final class ControlHttpServer {
     private static final Gson GSON = new Gson();
     private static final String[] MOVEMENT_SEQUENCE_KEYS = { "forward", "back", "left", "right", "jump", "sneak", "sprint", "use", "attack" };
@@ -1613,20 +1637,6 @@ public final class ControlHttpServer {
         };
     }
 
-    private static boolean isManagedControlKey(String keyName) {
-        if (keyName == null || keyName.isBlank()) {
-            return false;
-        }
-
-        String normalized = keyName.strip().toLowerCase(Locale.ROOT);
-        for (String key : MOVEMENT_SEQUENCE_KEYS) {
-            if (key.equals(normalized)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private final class ActionManager {
         private static final long FAST_LOOP_WINDOW_MS = 40L;
         private static final int FAST_LOOP_LIMIT = 8;
@@ -1923,164 +1933,6 @@ public final class ControlHttpServer {
     private static String messageFromSnapshot(Map<String, Object> snapshot) {
         Object value = snapshot.get("message");
         return value == null ? "action cancelled" : String.valueOf(value);
-    }
-
-    private static final class WebSocketSessionState {
-        private static final int DEFAULT_INTERVAL_MS = 50;
-        private static final int MIN_INTERVAL_MS = 25;
-        private static final int MAX_INTERVAL_MS = 5_000;
-
-        private final Object writeLock = new Object();
-        private final Set<String> topics = new LinkedHashSet<>();
-        private final Set<String> skipInitialTopics = new HashSet<>();
-        private final Map<String, String> lastPayloads = new LinkedHashMap<>();
-        private final Map<String, Boolean> activeControlKeys = new LinkedHashMap<>();
-
-        private volatile boolean open = true;
-        private volatile long nextPushAtMillis = 0L;
-        private volatile int intervalMs = DEFAULT_INTERVAL_MS;
-        private volatile long chatSince = -1L;
-        private volatile long lastControlInputAtMillis = 0L;
-
-        public synchronized Map<String, Object> subscribe(List<String> requestedTopics, Integer requestedIntervalMs, boolean includeInitial, Long requestedChatSince) {
-            if (requestedIntervalMs != null) {
-                if (requestedIntervalMs < MIN_INTERVAL_MS || requestedIntervalMs > MAX_INTERVAL_MS) {
-                    throw new IllegalArgumentException("intervalMs must be between " + MIN_INTERVAL_MS + " and " + MAX_INTERVAL_MS);
-                }
-                intervalMs = requestedIntervalMs;
-            }
-
-            topics.addAll(requestedTopics);
-            if (requestedChatSince != null) {
-                chatSince = requestedChatSince;
-            }
-
-            if (includeInitial) {
-                for (String topic : requestedTopics) {
-                    lastPayloads.remove(topic);
-                    skipInitialTopics.remove(topic);
-                }
-                nextPushAtMillis = 0L;
-            } else {
-                skipInitialTopics.addAll(requestedTopics);
-            }
-
-            return snapshot();
-        }
-
-        public synchronized Map<String, Object> unsubscribe(List<String> requestedTopics) {
-            if (requestedTopics.isEmpty()) {
-                topics.clear();
-                skipInitialTopics.clear();
-                lastPayloads.clear();
-            } else {
-                for (String topic : requestedTopics) {
-                    topics.remove(topic);
-                    skipInitialTopics.remove(topic);
-                    lastPayloads.remove(topic);
-                }
-            }
-            return snapshot();
-        }
-
-        public synchronized Map<String, Object> snapshot() {
-            Map<String, Object> payload = okPayload("ok");
-            payload.put("subscribed", new ArrayList<>(topics));
-            payload.put("intervalMs", intervalMs);
-            payload.put("chatSince", chatSince);
-            payload.put("controlIdleReleaseMs", DEFAULT_CONTROL_IDLE_RELEASE_MS);
-            return payload;
-        }
-
-        public synchronized List<String> topicsSnapshot() {
-            return new ArrayList<>(topics);
-        }
-
-        public synchronized boolean rememberPayload(String topic, String payload) {
-            if (skipInitialTopics.remove(topic)) {
-                lastPayloads.put(topic, payload);
-                return false;
-            }
-            String previous = lastPayloads.put(topic, payload);
-            return !payload.equals(previous);
-        }
-
-        public synchronized void recordControlInput(Map<String, Boolean> keyStates, boolean clearMovement) {
-            if (clearMovement) {
-                activeControlKeys.clear();
-            }
-
-            if (keyStates != null) {
-                for (Map.Entry<String, Boolean> entry : keyStates.entrySet()) {
-                    String key = entry.getKey() == null ? null : entry.getKey().strip().toLowerCase(Locale.ROOT);
-                    if (!isManagedControlKey(key)) {
-                        continue;
-                    }
-                    if (Boolean.TRUE.equals(entry.getValue())) {
-                        activeControlKeys.put(key, Boolean.TRUE);
-                    } else {
-                        activeControlKeys.remove(key);
-                    }
-                }
-            }
-
-            lastControlInputAtMillis = activeControlKeys.isEmpty()
-                ? 0L
-                : System.currentTimeMillis();
-        }
-
-        public synchronized Map<String, Boolean> consumeStaleControlRelease(long now) {
-            if (activeControlKeys.isEmpty() || lastControlInputAtMillis <= 0L || now - lastControlInputAtMillis < DEFAULT_CONTROL_IDLE_RELEASE_MS) {
-                return Collections.emptyMap();
-            }
-            return drainControlRelease();
-        }
-
-        public synchronized Map<String, Boolean> consumeAllControlRelease() {
-            if (activeControlKeys.isEmpty()) {
-                return Collections.emptyMap();
-            }
-            return drainControlRelease();
-        }
-
-        private Map<String, Boolean> drainControlRelease() {
-            Map<String, Boolean> releasedKeys = new LinkedHashMap<>();
-            for (String key : activeControlKeys.keySet()) {
-                releasedKeys.put(key, Boolean.FALSE);
-            }
-            activeControlKeys.clear();
-            lastControlInputAtMillis = 0L;
-            return releasedKeys;
-        }
-
-        public boolean shouldPushNow() {
-            long now = System.currentTimeMillis();
-            if (now < nextPushAtMillis) {
-                return false;
-            }
-            nextPushAtMillis = now + intervalMs;
-            return true;
-        }
-
-        public Object writeLock() {
-            return writeLock;
-        }
-
-        public long chatSince() {
-            return chatSince;
-        }
-
-        public void setChatSince(long chatSince) {
-            this.chatSince = chatSince;
-        }
-
-        public boolean isOpen() {
-            return open;
-        }
-
-        public void close() {
-            open = false;
-        }
     }
 
     private record HttpRequest(String method, String path, String query, Map<String, String> headers, byte[] body) {

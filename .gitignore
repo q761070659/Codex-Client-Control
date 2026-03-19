@@ -1,0 +1,10 @@
+.gradle/
+build/
+
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+neoforge/runs/

@@ -1,27 +1,79 @@
 # Codex Client Control
 
-这是一个给 `1.21.11 Fabric` 和 `1.21.11 NeoForge_21.11.38-beta` 准备的客户端控制模组。
+*给 AI，尤其是 Codex，一个能真正操作 Minecraft 客户端的本地接口。*
 
-它启动后会在本机开启一个只监听 `127.0.0.1` 的 HTTP 接口，方便通过脚本控制当前客户端。
+Codex Client Control 的出发点其实很明确：现在很多 AI 已经能写 Minecraft 相关代码、分析问题、规划流程，但一旦到了“真的去操作客户端”这一步，通常就断掉了。
 
-**特性：**
+所以这个 mod 做的事情，就是把本地正在运行的 Minecraft 客户端接成一个可调用的控制端。游戏启动后，它会在本机 `127.0.0.1` 打开一个带 token 的 HTTP / WebSocket 接口，让外部程序能读取客户端状态，也能把真实输入重新送回客户端。
 
-- HTTP REST API
-- WebSocket 实时推送与控制
-- 完整的 GUI 操作支持
-- 动作序列与托管任务
-- 本地调试假人实体
+这里说的“外部程序”，我最开始就是按 Codex 来想的，所以名字前面直接用了 `Codex`。这个项目本质上就是想给 Codex 一只手，让它不只是停留在文本层面，而是真的能去看、去点、去移动、去执行。
 
-如果你要更高频、更丝滑的连续动作，仓库里还有一个独立的 `LAN bot` 子项目：
+我选 HTTP 也是同样的思路：简单、直观、容易调试，而且对 AI 很友好。只要一个代理能发本地请求，它就能开始控制这个客户端，不需要额外塞一套复杂脚本运行时进去。
 
-- `lan-bot`
+简单一点说，你可以从外部脚本里让客户端前后左右移动、发送聊天、切快捷栏、操作 GUI、读取容器、查看准星目标，或者执行一段编排好的动作序列。
 
-它会作为第二个玩家直接加入你手动开放的局域网世界，适合寻路、连续放置、骨粉催熟、采集这类动作密集任务。详见 [lan-bot/README.md](lan-bot/README.md)。
+## 适合用来做什么
 
-当前会同时构建两个版本：
+- 给 Codex 或其他能发 HTTP 请求的 AI 代理接入 Minecraft 客户端
+- 写本地自动化脚本，处理重复操作或联调流程
+- 给客户端接一个控制面板、桌面助手或测试工具
+- 做需要“真实客户端反馈”的实验，而不是只发命令不看结果
+- 把 Minecraft 接到你自己的工作流、工具链或外部程序里
 
-- Fabric: `build/codex-client-control-fabric-1.0.0+1.21.11.jar`
-- NeoForge: `build/codex-client-control-neoforge-1.0.0+1.21.11.jar`
+如果你要的是更长时间、更高频的连续操作，仓库里还有一个独立的 `lan-bot` 子项目。它适合另一类场景；这个模组更偏向把“当前客户端”开放成一个稳定、可观察、可控制的本地接口。详见 [lan-bot/README.md](lan-bot/README.md)。
+
+## 能直接控制哪些东西
+
+- 玩家状态：位置、朝向、血量、饥饿值、快捷栏等
+- 输入操作：前后左右、跳跃、潜行、疾跑、交互、攻击、视角、快捷栏
+- 聊天与命令：发送聊天、执行命令、读取聊天缓存
+- GUI 与容器：关闭界面、点击、滚轮、键盘输入、读取控件和容器内容
+- 环境信息：准星目标、在线玩家列表、截图
+- 编排能力：动作序列、托管动作、WebSocket 实时订阅
+- 调试能力：本地调试假人
+
+## 为什么叫 Codex
+
+因为这个项目一开始就不是在做一个泛泛的“客户端控制 mod”。
+
+我的目标更具体：我想给 Codex 一个真正能落到 Minecraft 客户端上的控制桥，让它可以通过本地 HTTP 接口去访问状态、发送动作、执行测试，而不是只停留在“告诉你下一步该怎么做”。
+
+现在这套接口当然也能被别的脚本、桌面工具或者 AI 使用，但它的起点确实就是 Codex，这也是名字保留下来的原因。
+
+## 快速开始
+
+1. 启动一次游戏，让模组生成配置文件：`config/codex-client-control.properties`
+2. 读取配置里的 `token`
+3. 用带 `X-Auth-Token` 的请求访问 `http://127.0.0.1:47862/status`，确认接口已经可用
+
+PowerShell 简例：
+
+```powershell
+$token = (Get-Content .\config\codex-client-control.properties | Select-String '^token=').ToString().Split('=')[1]
+Invoke-RestMethod 'http://127.0.0.1:47862/status' -Headers @{ 'X-Auth-Token' = $token }
+```
+
+## 构建
+
+默认会构建 `gradle.properties` 里 `default_minecraft_version` 指向的版本，产物文件名会自动附带对应的 Minecraft 版本号。
+
+常用构建方式：
+
+- 构建默认版本：`gradlew build`
+- 构建 `1.21.11`：`gradlew buildMods1_21_11`
+- 构建 `1.21.8`：`gradlew buildMods1_21_8`
+- 一次性构建全部已支持版本：`gradlew buildAllSupportedMods`
+- 收集当前版本产物到根目录发布区：`gradlew collectCurrentMods`
+
+如果你确实想手动覆盖版本属性，在 Windows PowerShell 里请给 `minecraft_version` 加引号，或者直接用上面的版本任务名。
+
+产物目录：
+
+- Fabric: `fabric/build/<minecraft_version>/libs/`
+- NeoForge: `neoforge/build/<minecraft_version>/libs/`
+- 聚合发布目录: `build/release/<minecraft_version>/`
+
+如果你准备上传 Modrinth，可直接参考根目录里的 `MODRINTH_DESCRIPTION.md`。
 
 ## 已实现接口
 
@@ -463,25 +515,12 @@ HTTP 状态码：
 - `404` - 接口不存在
 - `500` - 服务器内部错误
 
-## 构建
+## 构建环境
 
-使用 Gradle 构建：
-
-```powershell
-.\gradlew build
-```
-
-构建产物：
-
-- Fabric: `build/codex-client-control-fabric-1.0.0+1.21.11.jar`
-- NeoForge: `build/codex-client-control-neoforge-1.0.0+1.21.11.jar`
-
-## 依赖
-
-- Minecraft 1.21.11
-- Fabric Loader 0.18.4+ / Fabric API 0.127.0+1.21.11
-- NeoForge 21.11.38-beta
 - Java 21
+- Fabric Loader `0.18.4`
+- Minecraft `1.21.11` / `1.21.8`
+- Fabric API 与 NeoForge 版本会按目标 Minecraft 版本自动解析
 
 
 ## 引用说明：

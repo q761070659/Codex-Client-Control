@@ -8,7 +8,24 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
+/**
+ * 聊天历史记录管理类。
+ *
+ * <p>使用环形缓冲区模式管理聊天消息，支持：</p>
+ * <ul>
+ *   <li>消息去重（基于时间戳、标签和内容的组合键）</li>
+ *   <li>固定容量限制（防止内存无限增长）</li>
+ *   <li>增量快照查询（基于序列号的范围查询）</li>
+ * </ul>
+ *
+ * <p>容量限制：</p>
+ * <ul>
+ *   <li>最大唯一键数量：4096</li>
+ *   <li>最大消息数量：1024</li>
+ * </ul>
+ */
 final class ChatHistory {
     private static final int MAX_KEYS = 4096;
     private static final int MAX_MESSAGES = 1024;
@@ -44,18 +61,16 @@ final class ChatHistory {
     }
 
     public synchronized Map<String, Object> snapshot(long sinceExclusive, int limit, List<String> recentTyped) {
-        List<Map<String, Object>> selected = new ArrayList<>();
         int safeLimit = Math.max(1, limit);
 
-        for (Map<String, Object> message : messages) {
-            long sequence = ((Number) message.get("sequence")).longValue();
-            if (sequence > sinceExclusive) {
-                selected.add(message);
-            }
-        }
+        List<Map<String, Object>> trimmed = messages.stream()
+            .filter(msg -> ((Number) msg.get("sequence")).longValue() > sinceExclusive)
+            .collect(Collectors.toList());
 
-        int fromIndex = Math.max(0, selected.size() - safeLimit);
-        List<Map<String, Object>> trimmed = new ArrayList<>(selected.subList(fromIndex, selected.size()));
+        int fromIndex = Math.max(0, trimmed.size() - safeLimit);
+        if (fromIndex > 0) {
+            trimmed = new ArrayList<>(trimmed.subList(fromIndex, trimmed.size()));
+        }
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", Boolean.TRUE);
