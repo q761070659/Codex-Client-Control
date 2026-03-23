@@ -161,6 +161,7 @@ public final class MinecraftBridge {
     private final Method screenshotGrabMethod;
     private final Method interactionResultConsumesActionMethod;
     private final Method interactionResultShouldSwingMethod;
+    private final Method interactionResultSwingSourceMethod;
     private final Method playerSwingMethod;
 
     private final Constructor<?> gameProfileConstructor;
@@ -212,6 +213,7 @@ public final class MinecraftBridge {
     private final Object directionEast;
     private final Object mainHand;
     private final Object offHand;
+    private final Object interactionResultSwingSourceNone;
 
     public MinecraftBridge() throws ReflectiveOperationException {
         minecraftClass = findClass("net.minecraft.client.Minecraft", "gfj");
@@ -288,7 +290,7 @@ public final class MinecraftBridge {
         gameModeSyncSelectedSlotMethod = findMethodAny(gameModeClass, new String[]{"ensureHasSentCarriedItem", "l"});
         gameModeUseItemOnMethod = findGameModeUseItemOnMethod();
         interactionHandClass = gameModeUseItemOnMethod.getParameterTypes()[1];
-        gameModeUseItemMethod = findMethodAny(gameModeClass, new String[]{"useItem", "a"}, localPlayerClass, interactionHandClass);
+        gameModeUseItemMethod = findGameModeUseItemMethod();
         guiGetChatMethod = findMethodAny(guiClass, new String[]{"getChat", "e"});
         componentGetStringMethod = findMethodAny(componentClass, new String[]{"getString"});
         componentLiteralMethod = findMethodAny(componentClass, new String[]{"literal", "b"}, String.class);
@@ -352,7 +354,10 @@ public final class MinecraftBridge {
         playerSwingMethod = findMethodAny(playerClass, new String[]{"swing", "a"}, interactionHandClass);
         screenshotGrabMethod = findMethodAny(screenshotClass, new String[]{"grab", "a"}, File.class, String.class, renderTargetClass, int.class, Consumer.class);
         interactionResultConsumesActionMethod = findMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"consumesAction", "a"});
-        interactionResultShouldSwingMethod = findMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"shouldSwing", "b"});
+        interactionResultShouldSwingMethod = findOptionalMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"shouldSwing", "b"});
+        interactionResultSwingSourceMethod = interactionResultShouldSwingMethod == null
+            ? findOptionalMethodAny(gameModeUseItemOnMethod.getReturnType(), new String[]{"swingSource", "c"})
+            : null;
 
         localPlayerConnectionField = findFieldAny(localPlayerClass, "connection", "b");
         playerInventoryField = findFieldAny(playerClass, "inventory", "cE");
@@ -397,6 +402,9 @@ public final class MinecraftBridge {
         directionEast = findFieldAny(directionClass, "EAST", "f").get(null);
         mainHand = findFieldAny(interactionHandClass, "MAIN_HAND", "a").get(null);
         offHand = findFieldAny(interactionHandClass, "OFF_HAND", "b").get(null);
+        interactionResultSwingSourceNone = interactionResultSwingSourceMethod == null
+            ? null
+            : findFieldAny(interactionResultSwingSourceMethod.getReturnType(), "NONE", "a").get(null);
     }
 
     public Path getGameDirectory() throws ReflectiveOperationException {
@@ -1142,7 +1150,7 @@ public final class MinecraftBridge {
             Object hand = resolveInteractionHand(normalizedHand);
             Object result = gameModeUseItemMethod.invoke(gameMode, player, hand);
             boolean consumesAction = (Boolean) interactionResultConsumesActionMethod.invoke(result);
-            boolean shouldSwing = (Boolean) interactionResultShouldSwingMethod.invoke(result);
+            boolean shouldSwing = shouldSwing(result, consumesAction);
             if (shouldSwing) {
                 playerSwingMethod.invoke(player, hand);
             }
@@ -1187,7 +1195,7 @@ public final class MinecraftBridge {
             Object blockHitResult = blockHitResultConstructor.newInstance(location, direction, blockPos, inside);
             Object result = gameModeUseItemOnMethod.invoke(gameMode, player, hand, blockHitResult);
             boolean consumesAction = (Boolean) interactionResultConsumesActionMethod.invoke(result);
-            boolean shouldSwing = (Boolean) interactionResultShouldSwingMethod.invoke(result);
+            boolean shouldSwing = shouldSwing(result, consumesAction);
             if (shouldSwing) {
                 playerSwingMethod.invoke(player, hand);
             }
@@ -1904,6 +1912,56 @@ public final class MinecraftBridge {
         }
 
         throw new NoSuchMethodException(gameModeClass.getName() + "#useItemOn");
+    }
+
+    private Method findGameModeUseItemMethod() throws ReflectiveOperationException {
+        for (Method method : gameModeClass.getMethods()) {
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            if (parameterTypes.length != 2) {
+                continue;
+            }
+            if (!playerClass.isAssignableFrom(parameterTypes[0]) || parameterTypes[1] != interactionHandClass) {
+                continue;
+            }
+            String name = method.getName();
+            if (!"useItem".equals(name) && !"a".equals(name)) {
+                continue;
+            }
+            method.setAccessible(true);
+            return method;
+        }
+
+        for (Method method : gameModeClass.getDeclaredMethods()) {
+            Class<?>[] parameterTypes = method.getParameterTypes();
+            if (parameterTypes.length != 2) {
+                continue;
+            }
+            if (!playerClass.isAssignableFrom(parameterTypes[0]) || parameterTypes[1] != interactionHandClass) {
+                continue;
+            }
+            String name = method.getName();
+            if (!"useItem".equals(name) && !"a".equals(name)) {
+                continue;
+            }
+            method.setAccessible(true);
+            return method;
+        }
+
+        throw new NoSuchMethodException(gameModeClass.getName() + "#useItem");
+    }
+
+    private boolean shouldSwing(Object result, boolean consumesAction) throws ReflectiveOperationException {
+        if (result == null) {
+            return false;
+        }
+        if (interactionResultShouldSwingMethod != null) {
+            return (Boolean) interactionResultShouldSwingMethod.invoke(result);
+        }
+        if (interactionResultSwingSourceMethod != null) {
+            Object swingSource = interactionResultSwingSourceMethod.invoke(result);
+            return swingSource != null && !Objects.equals(swingSource, interactionResultSwingSourceNone);
+        }
+        return consumesAction;
     }
 
     private static Method findOptionalMethodAny(Class<?> owner, String[] names, Class<?>... parameterTypes) {

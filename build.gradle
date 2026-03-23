@@ -44,6 +44,8 @@ ext.legacy_module_build_entries = [
         'resources',
         'tmp'
 ].asImmutable()
+ext.hasFabricModule = findProject(':fabric') != null
+ext.hasNeoForgeModule = findProject(':neoforge') != null
 
 allprojects {
     group = project.maven_group
@@ -128,7 +130,14 @@ def taskSuffixForMinecraftVersion = { String minecraftVersion ->
 def gradleWrapperCommandForMinecraftVersion = { String minecraftVersion ->
     def buildProperties = buildPropertiesForMinecraftVersion(minecraftVersion)
     def propertyArgs = buildProperties.collect { key, value -> "-P${key}=${value}" }
-    def gradleArgs = [':fabric:build', ':neoforge:build'] + propertyArgs
+    def gradleArgs = []
+    if (rootProject.hasFabricModule) {
+        gradleArgs << ':fabric:build'
+    }
+    if (rootProject.hasNeoForgeModule) {
+        gradleArgs << ':neoforge:build'
+    }
+    gradleArgs.addAll(propertyArgs)
 
     if (System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')) {
         return ['cmd', '/c', 'gradlew.bat'] + gradleArgs
@@ -155,14 +164,19 @@ tasks.register('printBuildMatrix') {
 tasks.register('collectCurrentMods', Sync) {
     group = 'build'
     description = "Collect the currently selected Minecraft ${rootProject.minecraft_version} artifacts into build/release/${rootProject.minecraft_version}."
-    dependsOn ':fabric:build', ':neoforge:build'
     into(layout.buildDirectory.dir("release/${rootProject.minecraft_version}"))
 
-    from(project(':fabric').projectDir.toPath().resolve("build").resolve(rootProject.minecraft_version).resolve("libs").toFile()) {
-        include "${rootProject.archives_base_name}-fabric-${rootProject.resolved_mod_version}*.jar"
+    if (rootProject.hasFabricModule) {
+        dependsOn ':fabric:build'
+        from(project(':fabric').projectDir.toPath().resolve("build").resolve(rootProject.minecraft_version).resolve("libs").toFile()) {
+            include "${rootProject.archives_base_name}-fabric-${rootProject.resolved_mod_version}*.jar"
+        }
     }
-    from(project(':neoforge').projectDir.toPath().resolve("build").resolve(rootProject.minecraft_version).resolve("libs").toFile()) {
-        include "${rootProject.archives_base_name}-neoforge-${rootProject.resolved_mod_version}*.jar"
+    if (rootProject.hasNeoForgeModule) {
+        dependsOn ':neoforge:build'
+        from(project(':neoforge').projectDir.toPath().resolve("build").resolve(rootProject.minecraft_version).resolve("libs").toFile()) {
+            include "${rootProject.archives_base_name}-neoforge-${rootProject.resolved_mod_version}*.jar"
+        }
     }
 }
 
@@ -188,11 +202,15 @@ rootProject.supported_minecraft_versions.each { minecraftVersion ->
         dependsOn tasks.named("buildMods${taskSuffix}")
         into(layout.buildDirectory.dir("release/${minecraftVersion}"))
 
-        from(project(':fabric').projectDir.toPath().resolve("build").resolve(minecraftVersion).resolve("libs").toFile()) {
-            include "${rootProject.archives_base_name}-fabric-${rootProject.mod_version}+${minecraftVersion}*.jar"
+        if (rootProject.hasFabricModule) {
+            from(project(':fabric').projectDir.toPath().resolve("build").resolve(minecraftVersion).resolve("libs").toFile()) {
+                include "${rootProject.archives_base_name}-fabric-${rootProject.mod_version}+${minecraftVersion}*.jar"
+            }
         }
-        from(project(':neoforge').projectDir.toPath().resolve("build").resolve(minecraftVersion).resolve("libs").toFile()) {
-            include "${rootProject.archives_base_name}-neoforge-${rootProject.mod_version}+${minecraftVersion}*.jar"
+        if (rootProject.hasNeoForgeModule) {
+            from(project(':neoforge').projectDir.toPath().resolve("build").resolve(minecraftVersion).resolve("libs").toFile()) {
+                include "${rootProject.archives_base_name}-neoforge-${rootProject.mod_version}+${minecraftVersion}*.jar"
+            }
         }
     }
 }

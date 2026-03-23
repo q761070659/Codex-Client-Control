@@ -36,6 +36,13 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'codex-client-control'
+
+def targetLoader = gradle.startParameter.projectProperties.get('target_loader')?.toString()?.toLowerCase()
+
 include ':common'
-include ':fabric'
-include ':neoforge'
+if (targetLoader == null || targetLoader == 'fabric') {
+    include ':fabric'
+}
+if (targetLoader == null || targetLoader == 'neoforge') {
+    include ':neoforge'
+}
